@@ -50,11 +50,18 @@ struct _GstRfbSrc
 {
   GstPushSrc element;
 
+  /* Connection parameters — authoritative storage, applied to decoder in start() */
+  gchar *host;
+  gint port;
   gchar *user;
   gchar *pass;
+  gint offset_x;
+  gint offset_y;
+  gint width;
+  gint height;
+  gboolean shared;
 
-  rfbClient *decoder;
-  gboolean go;
+  rfbClient *decoder;   /* non-NULL only between start() and stop() */
 };
 
 GType gst_rfb_src_get_type (void);
