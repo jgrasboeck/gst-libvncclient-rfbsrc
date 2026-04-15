@@ -152,7 +152,7 @@ gst_rfb_src_get_credential (rfbClient * cl, int credentialType)
   rfbCredential *cred;
 
   if (credentialType != rfbCredentialTypeUser) {
-    GST_ELEMENT_ERROR (src, RESOURCE, AUTH,
+    GST_ELEMENT_ERROR (src, RESOURCE, NOT_AUTHORIZED,
         ("Unsupported VNC credential type %d", credentialType), (NULL));
     return NULL;
   }
