@@ -453,6 +453,12 @@ gst_rfb_src_start (GstBaseSrc * bsrc)
   src->decoder->appData.useRemoteCursor = 1;
   src->decoder->appData.shareDesktop = src->shared;
 
+  /* Override auth callbacks immediately after rfbGetClient() so the library's
+   * default (which may call getpass() on some versions) is never invoked. */
+  rfbClientSetClientData (src->decoder, &rfb_src_client_data_key, src);
+  src->decoder->GetPassword = gst_rfb_src_get_password;
+  src->decoder->GetCredential = gst_rfb_src_get_credential;
+
   /* Apply capture region only if the user set an explicit size.
    * If not, updateRect stays zero and negotiate() will default to full frame. */
   if (src->width > 0 && src->height > 0) {
@@ -491,11 +497,6 @@ gst_rfb_src_negotiate (GstBaseSrc * bsrc)
 
   GST_DEBUG_OBJECT (src, "connecting to host %s on port %d",
       decoder->serverHost, decoder->serverPort);
-
-  /* Store src pointer before connecting so the auth callbacks can reach it */
-  rfbClientSetClientData (decoder, &rfb_src_client_data_key, src);
-  decoder->GetPassword = gst_rfb_src_get_password;
-  decoder->GetCredential = gst_rfb_src_get_credential;
 
   if (!ConnectToRFBServer (decoder, decoder->serverHost, decoder->serverPort)) {
     GST_ELEMENT_ERROR (src, RESOURCE, READ,
