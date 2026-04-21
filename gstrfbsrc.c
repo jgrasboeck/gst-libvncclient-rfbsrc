@@ -217,7 +217,7 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
           65535, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_SHARED,
       g_param_spec_boolean ("shared", "Share desktop with other clients",
-          "Share desktop with other clients", TRUE,
+          "Share desktop with other clients", 1,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gstbasesrc_class->start = GST_DEBUG_FUNCPTR (gst_rfb_src_start);
