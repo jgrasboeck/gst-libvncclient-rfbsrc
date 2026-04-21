@@ -83,6 +83,8 @@ static void gst_rfb_src_get_property (GObject * object, guint prop_id,
 static gboolean gst_rfb_src_start (GstBaseSrc * bsrc);
 static gboolean gst_rfb_src_negotiate (GstBaseSrc * bsrc);
 static gboolean gst_rfb_src_stop (GstBaseSrc * bsrc);
+static gboolean gst_rfb_src_unlock (GstBaseSrc * bsrc);
+static gboolean gst_rfb_src_unlock_stop (GstBaseSrc * bsrc);
 static gboolean gst_rfb_src_event (GstBaseSrc * bsrc, GstEvent * event);
 static gboolean gst_rfb_src_decide_allocation (GstBaseSrc * bsrc,
     GstQuery * query);
@@ -221,6 +223,8 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
   gstbasesrc_class->start = GST_DEBUG_FUNCPTR (gst_rfb_src_start);
   gstbasesrc_class->negotiate = GST_DEBUG_FUNCPTR (gst_rfb_src_negotiate);
   gstbasesrc_class->stop = GST_DEBUG_FUNCPTR (gst_rfb_src_stop);
+  gstbasesrc_class->unlock = GST_DEBUG_FUNCPTR (gst_rfb_src_unlock);
+  gstbasesrc_class->unlock_stop = GST_DEBUG_FUNCPTR (gst_rfb_src_unlock_stop);
   gstbasesrc_class->event = GST_DEBUG_FUNCPTR (gst_rfb_src_event);
   gstpushsrc_class->fill = GST_DEBUG_FUNCPTR (gst_rfb_src_fill);
   gstbasesrc_class->decide_allocation =
@@ -433,6 +437,22 @@ process_update (rfbClient * cl, int x, int y, int w, int h)
  * GstBaseSrc vmethod implementations
  * --------------------------------------------------------------------------- */
 
+static gboolean
+gst_rfb_src_unlock (GstBaseSrc * bsrc)
+{
+  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  g_atomic_int_set (&src->unlocked, 1);
+  return TRUE;
+}
+
+static gboolean
+gst_rfb_src_unlock_stop (GstBaseSrc * bsrc)
+{
+  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  g_atomic_int_set (&src->unlocked, 0);
+  return TRUE;
+}
+
 /*
  * start() — called on NULL→READY.
  *
@@ -626,6 +646,8 @@ gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf)
    * triggers process_update(), which atomically increments the counter. */
   gint *received_update = rfbClientGetClientData (decoder, process_update);
   while (!g_atomic_int_get (received_update)) {
+    if (g_atomic_int_get (&src->unlocked))
+      return GST_FLOW_FLUSHING;
     int ret = WaitForMessage (decoder, 50000);
     if (ret < 0 || (ret > 0 && !HandleRFBServerMessage (decoder))) {
       GST_ELEMENT_ERROR (src, RESOURCE, READ,

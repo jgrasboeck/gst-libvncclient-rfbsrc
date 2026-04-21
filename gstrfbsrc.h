@@ -62,6 +62,8 @@ struct _GstRfbSrc
   gboolean shared;
 
   rfbClient *decoder;   /* non-NULL only between start() and stop() */
+
+  volatile gint unlocked; /* set by unlock(), cleared by unlock_stop() */
 };
 
 GType gst_rfb_src_get_type (void);
