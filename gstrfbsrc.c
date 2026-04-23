@@ -89,6 +89,9 @@ static gboolean gst_rfb_src_event (GstBaseSrc * bsrc, GstEvent * event);
 static gboolean gst_rfb_src_decide_allocation (GstBaseSrc * bsrc,
     GstQuery * query);
 static GstFlowReturn gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf);
+static void gst_rfb_got_cursor_shape (rfbClient * cl, int xhot, int yhot,
+    int width, int height, int bpp);
+static rfbBool gst_rfb_handle_cursor_pos (rfbClient * cl, int x, int y);
 
 #define gst_rfb_src_parent_class parent_class
 G_DEFINE_TYPE (GstRfbSrc, gst_rfb_src, GST_TYPE_PUSH_SRC);
@@ -163,6 +166,44 @@ gst_rfb_src_get_credential (rfbClient * cl, int credentialType)
   cred->userCredential.username = g_strdup (src->user ? src->user : "");
   cred->userCredential.password = g_strdup (src->pass ? src->pass : "");
   return cred;
+}
+
+/* ---------------------------------------------------------------------------
+ * Cursor callbacks (client-side software cursor blending)
+ *
+ * When the server supports cursor-shape encodings (XCursor / RichCursor),
+ * it stops drawing the cursor into the framebuffer and instead sends shape
+ * and position updates.  We store the received data and blend the cursor
+ * onto every output frame in fill().  Both callbacks also increment
+ * received_update so that fill()'s wait loop wakes up on cursor-only events.
+ *
+ * When the server does NOT support these encodings it draws the cursor
+ * directly into the framebuffer and fires GotFrameBufferUpdate normally —
+ * the fields below stay zero-initialised and the blending path is skipped.
+ * --------------------------------------------------------------------------- */
+
+static void
+gst_rfb_got_cursor_shape (rfbClient * cl, int xhot, int yhot,
+    int width, int height, int bpp)
+{
+  GstRfbSrc *src = rfbClientGetClientData (cl, &rfb_src_client_data_key);
+  src->cursor_hot_x = xhot;
+  src->cursor_hot_y = yhot;
+  src->cursor_width = width;
+  src->cursor_height = height;
+  gint *received_update = rfbClientGetClientData (cl, process_update);
+  g_atomic_int_inc (received_update);
+}
+
+static rfbBool
+gst_rfb_handle_cursor_pos (rfbClient * cl, int x, int y)
+{
+  GstRfbSrc *src = rfbClientGetClientData (cl, &rfb_src_client_data_key);
+  src->cursor_x = x;
+  src->cursor_y = y;
+  gint *received_update = rfbClientGetClientData (cl, process_update);
+  g_atomic_int_inc (received_update);
+  return TRUE;
 }
 
 /* ---------------------------------------------------------------------------
@@ -479,6 +520,18 @@ gst_rfb_src_start (GstBaseSrc * bsrc)
   src->decoder->GetPassword = gst_rfb_src_get_password;
   src->decoder->GetCredential = gst_rfb_src_get_credential;
 
+  /* Request cursor shape/position encodings.  The server blends the cursor
+   * into the framebuffer only when it doesn't support these encodings, so
+   * we implement software blending ourselves as a complement. */
+  src->decoder->appData.useRemoteCursor = 1;
+  src->decoder->GotCursorShape = gst_rfb_got_cursor_shape;
+  src->decoder->HandleCursorPos = gst_rfb_handle_cursor_pos;
+
+  /* Reset software-cursor state for clean start / restart. */
+  src->cursor_x = src->cursor_y = 0;
+  src->cursor_hot_x = src->cursor_hot_y = 0;
+  src->cursor_width = src->cursor_height = 0;
+
   /* Apply capture region only if the user set an explicit size.
    * If not, updateRect stays zero and negotiate() will default to full frame. */
   if (src->width > 0 && src->height > 0) {
@@ -680,6 +733,33 @@ gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf)
         &decoder->frameBuffer[bpp * (decoder->updateRect.x +
                 (decoder->updateRect.y + i) * decoder->width)],
         decoder->updateRect.w * bpp);
+  }
+
+  /* Software cursor blending: active only when the server sent cursor-shape
+   * encodings (rcSource non-NULL).  When the server drew the cursor into the
+   * framebuffer itself this block is skipped. */
+  if (src->cursor_width > 0 && src->cursor_height > 0 && decoder->rcSource
+      && decoder->rcMask) {
+    int mask_row_bytes = (src->cursor_width + 7) / 8;
+    /* Top-left corner of cursor in the capture-rect coordinate system */
+    int cx = src->cursor_x - src->cursor_hot_x - decoder->updateRect.x;
+    int cy = src->cursor_y - src->cursor_hot_y - decoder->updateRect.y;
+
+    for (int row = 0; row < src->cursor_height; row++) {
+      int fy = cy + row;
+      if (fy < 0 || fy >= decoder->updateRect.h)
+        continue;
+      for (int col = 0; col < src->cursor_width; col++) {
+        int fx = cx + col;
+        if (fx < 0 || fx >= decoder->updateRect.w)
+          continue;
+        /* Skip transparent pixels (1-bit mask, MSB first) */
+        if (!(decoder->rcMask[row * mask_row_bytes + col / 8] & (0x80 >> (col % 8))))
+          continue;
+        memcpy (info.data + (fy * decoder->updateRect.w + fx) * bpp,
+            decoder->rcSource + (row * src->cursor_width + col) * bpp, bpp);
+      }
+    }
   }
 
   GST_BUFFER_PTS (outbuf) =

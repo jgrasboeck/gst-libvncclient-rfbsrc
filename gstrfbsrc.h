@@ -64,6 +64,18 @@ struct _GstRfbSrc
   rfbClient *decoder;   /* non-NULL only between start() and stop() */
 
   volatile gint unlocked; /* set by unlock(), cleared by unlock_stop() */
+
+  /* Client-side cursor blending: populated by GotCursorShape / HandleCursorPos.
+   * Only used when the server sends cursor shape/position encodings
+   * (useRemoteCursor = 1).  When the server doesn't support those encodings it
+   * falls back to drawing the cursor into the framebuffer directly, so these
+   * fields are never touched and blending is simply skipped. */
+  gint cursor_x;
+  gint cursor_y;
+  gint cursor_hot_x;
+  gint cursor_hot_y;
+  gint cursor_width;
+  gint cursor_height;
 };
 
 GType gst_rfb_src_get_type (void);
