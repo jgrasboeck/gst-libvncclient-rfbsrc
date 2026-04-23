@@ -740,7 +740,6 @@ gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf)
    * framebuffer itself this block is skipped. */
   if (src->cursor_width > 0 && src->cursor_height > 0 && decoder->rcSource
       && decoder->rcMask) {
-    int mask_row_bytes = (src->cursor_width + 7) / 8;
     /* Top-left corner of cursor in the capture-rect coordinate system */
     int cx = src->cursor_x - src->cursor_hot_x - decoder->updateRect.x;
     int cy = src->cursor_y - src->cursor_hot_y - decoder->updateRect.y;
@@ -753,8 +752,8 @@ gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf)
         int fx = cx + col;
         if (fx < 0 || fx >= decoder->updateRect.w)
           continue;
-        /* Skip transparent pixels (1-bit mask, MSB first) */
-        if (!(decoder->rcMask[row * mask_row_bytes + col / 8] & (0x80 >> (col % 8))))
+        /* libvncclient stores rcMask as one byte per pixel (0=transparent, 1=opaque) */
+        if (!decoder->rcMask[row * src->cursor_width + col])
           continue;
         memcpy (info.data + (fy * decoder->updateRect.w + fx) * bpp,
             decoder->rcSource + (row * src->cursor_width + col) * bpp, bpp);
