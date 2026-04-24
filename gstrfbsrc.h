@@ -76,6 +76,13 @@ struct _GstRfbSrc
   gint cursor_hot_y;
   gint cursor_width;
   gint cursor_height;
+
+  /* Pre-computed at GotCursorShape time: 1-byte-per-pixel mask of transparent
+   * pixels adjacent (4-connected) to opaque cursor pixels.  Drawn in a
+   * contrasting colour before the cursor pixels to guarantee visibility
+   * regardless of cursor colour or background colour. */
+  guint8 *cursor_outline;
+  guint8  cursor_outline_pixel[4];
 };
 
 GType gst_rfb_src_get_type (void);

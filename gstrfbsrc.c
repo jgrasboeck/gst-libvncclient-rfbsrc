@@ -191,6 +191,42 @@ gst_rfb_got_cursor_shape (rfbClient * cl, int xhot, int yhot,
   src->cursor_hot_y = yhot;
   src->cursor_width = width;
   src->cursor_height = height;
+
+  /* Determine contrasting outline colour by averaging the luminance of all
+   * opaque cursor pixels.  Dark cursor → white outline; light → black.
+   * Computed once here so fill() pays zero per-frame cost. */
+  guint64 luma_sum = 0;
+  gint opaque_count = 0;
+  for (gint i = 0; i < width * height; i++) {
+    if (cl->rcMask[i]) {
+      guint8 *px = cl->rcSource + i * bpp;
+      for (gint b = 0; b < bpp; b++)
+        luma_sum += px[b];
+      opaque_count++;
+    }
+  }
+  guint8 avg = (opaque_count > 0) ? (guint8) (luma_sum / (opaque_count * bpp)) : 0;
+  guint8 outline_val = (avg < 128) ? 0xFF : 0x00;
+  for (gint b = 0; b < 4; b++)
+    src->cursor_outline_pixel[b] = outline_val;
+
+  /* Build 4-connected outline mask: transparent pixels inside the cursor rect
+   * that are adjacent to at least one opaque pixel.  These will be painted in
+   * the contrasting colour so the cursor edge is always legible. */
+  g_free (src->cursor_outline);
+  src->cursor_outline = g_new0 (guint8, width * height);
+  for (gint row = 0; row < height; row++) {
+    for (gint col = 0; col < width; col++) {
+      if (cl->rcMask[row * width + col])
+        continue;
+      if ((col > 0         && cl->rcMask[row * width + col - 1]) ||
+          (col < width - 1 && cl->rcMask[row * width + col + 1]) ||
+          (row > 0         && cl->rcMask[(row - 1) * width + col]) ||
+          (row < height - 1 && cl->rcMask[(row + 1) * width + col]))
+        src->cursor_outline[row * width + col] = 1;
+    }
+  }
+
   gint *received_update = rfbClientGetClientData (cl, process_update);
   g_atomic_int_inc (received_update);
 }
@@ -316,6 +352,7 @@ gst_rfb_src_finalize (GObject * object)
   g_free (src->host);
   g_free (src->user);
   g_free (src->pass);
+  g_free (src->cursor_outline);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -531,6 +568,8 @@ gst_rfb_src_start (GstBaseSrc * bsrc)
   src->cursor_x = src->cursor_y = 0;
   src->cursor_hot_x = src->cursor_hot_y = 0;
   src->cursor_width = src->cursor_height = 0;
+  g_free (src->cursor_outline);
+  src->cursor_outline = NULL;
 
   /* Apply capture region only if the user set an explicit size.
    * If not, updateRect stays zero and negotiate() will default to full frame. */
@@ -669,6 +708,9 @@ gst_rfb_src_stop (GstBaseSrc * bsrc)
   gint *received_update = rfbClientGetClientData (src->decoder, process_update);
   g_free (received_update);
 
+  g_free (src->cursor_outline);
+  src->cursor_outline = NULL;
+
   /* rfbClientCleanup() closes the socket and frees decoder->serverHost */
   rfbClientCleanup (src->decoder);
   src->decoder = NULL;
@@ -752,11 +794,15 @@ gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf)
         int fx = cx + col;
         if (fx < 0 || fx >= decoder->updateRect.w)
           continue;
+        int idx = row * src->cursor_width + col;
+        guint8 *dst = info.data + (fy * decoder->updateRect.w + fx) * bpp;
         /* libvncclient stores rcMask as one byte per pixel (0=transparent, 1=opaque) */
-        if (!decoder->rcMask[row * src->cursor_width + col])
-          continue;
-        memcpy (info.data + (fy * decoder->updateRect.w + fx) * bpp,
-            decoder->rcSource + (row * src->cursor_width + col) * bpp, bpp);
+        if (decoder->rcMask[idx]) {
+          memcpy (dst, decoder->rcSource + idx * bpp, bpp);
+        } else if (src->cursor_outline && src->cursor_outline[idx]) {
+          /* Contrasting outline pixel — computed once in GotCursorShape */
+          memcpy (dst, src->cursor_outline_pixel, bpp);
+        }
       }
     }
   }
