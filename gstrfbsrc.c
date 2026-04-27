@@ -949,6 +949,9 @@ static gboolean
 gst_rfb_src_signal_send_clipboard (GstRfbSrc * src, const gchar * text)
 {
   gboolean ret;
+  gchar *latin1 = NULL;
+  gsize bytes_written = 0;
+  GError *error = NULL;
 
   if (text == NULL)
     return FALSE;
@@ -962,8 +965,20 @@ gst_rfb_src_signal_send_clipboard (GstRfbSrc * src, const gchar * text)
         "dropping clipboard event because VNC is not connected");
     ret = FALSE;
   } else {
-    ret = SendClientCutTextUTF8 (src->client, (char *) text,
-        (int) strlen (text)) ? TRUE : FALSE;
+    /* Older LibVNCClient only exposes SendClientCutText(), whose payload is
+     * Latin-1. Keep the plugin linkable there and degrade non-Latin-1 chars. */
+    latin1 = g_convert_with_fallback (text, -1, "ISO-8859-1", "UTF-8", "?",
+        NULL, &bytes_written, &error);
+    if (latin1 == NULL) {
+      GST_WARNING_OBJECT (src, "could not convert clipboard text: %s",
+          error->message);
+      g_clear_error (&error);
+      ret = FALSE;
+    } else {
+      ret = SendClientCutText (src->client, latin1, (int) bytes_written) ?
+          TRUE : FALSE;
+      g_free (latin1);
+    }
   }
 
   g_rec_mutex_unlock (&src->client_lock);
