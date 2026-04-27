@@ -1,4 +1,5 @@
 /* GStreamer
+ * Copyright (C) <2007> Thijs Vermeir <thijsvermeir@gmail.com>
  * Copyright (C) <2006> Andre Moreira Magalhaes <andre.magalhaes@indt.org.br>
  * Copyright (C) <2004> David A. Schleef <ds@schleef.org>
  * Copyright (C) <1999> Erik Walthinsen <omega@cse.ogi.edu>
@@ -25,9 +26,11 @@
 #include <gst/gst.h>
 #include <gst/base/gstpushsrc.h>
 #include <gst/video/gstvideopool.h>
+
 #include <rfb/rfbclient.h>
 
 G_BEGIN_DECLS
+
 #define GST_TYPE_RFB_SRC \
   (gst_rfb_src_get_type())
 #define GST_RFB_SRC(obj) \
@@ -38,6 +41,7 @@ G_BEGIN_DECLS
   (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_RFB_SRC))
 #define GST_IS_RFB_SRC_CLASS(klass) \
   (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_RFB_SRC))
+
 typedef struct _GstRfbSrc GstRfbSrc;
 typedef struct _GstRfbSrcClass GstRfbSrcClass;
 
@@ -50,42 +54,51 @@ struct _GstRfbSrc
 {
   GstPushSrc element;
 
-  /* Connection parameters — authoritative storage, applied to decoder in start() */
+  /* connection properties */
+  GstUri *uri;
   gchar *host;
   gint port;
-  gchar *user;
-  gchar *pass;
-  gint offset_x;
-  gint offset_y;
-  gint width;
-  gint height;
+  gchar *password;
+
+  /* stream properties */
+  gboolean incremental_update;
+  gboolean view_only;
   gboolean shared;
+  guint offset_x;
+  guint offset_y;
+  guint req_width;   /* 0 = full desktop width */
+  guint req_height;  /* 0 = full desktop height */
 
-  rfbClient *decoder;   /* non-NULL only between start() and stop() */
+  /* input state - only modified from the streaming/event thread */
+  guint button_mask;
 
-  volatile gint unlocked; /* set by unlock(), cleared by unlock_stop() */
+  /* libvncclient handle - valid between negotiate and stop */
+  rfbClient *client;
 
-  /* Client-side cursor blending: populated by GotCursorShape / HandleCursorPos.
-   * Only used when the server sends cursor shape/position encodings
-   * (useRemoteCursor = 1).  When the server doesn't support those encodings it
-   * falls back to drawing the cursor into the framebuffer directly, so these
-   * fields are never touched and blending is simply skipped. */
-  gint cursor_x;
-  gint cursor_y;
-  gint cursor_hot_x;
-  gint cursor_hot_y;
-  gint cursor_width;
-  gint cursor_height;
+  /* background receiver thread drives rfbProcessServerMessage;
+   * input events (SendPointerEvent / SendKeyEvent) are sent directly
+   * from gst_rfb_src_event and never blocked by frame reception */
+  GThread   *receiver_thread;
+  gint       running;   /* g_atomic_int, 1 while receiver loop is alive */
 
-  /* Pre-computed at GotCursorShape time: 1-byte-per-pixel mask of transparent
-   * pixels adjacent (4-connected) to opaque cursor pixels.  Drawn in a
-   * contrasting colour before the cursor pixels to guarantee visibility
-   * regardless of cursor colour or background colour. */
-  guint8 *cursor_outline;
-  guint8  cursor_outline_pixel[4];
+  /* frame double-buffer:
+   *   receiver thread writes client->frameBuffer (libvncclient-managed),
+   *   FinishedFrameBufferUpdate snapshots it into frame_snapshot under mutex,
+   *   gst_rfb_src_fill reads frame_snapshot under mutex.
+   *   Input events bypass this path entirely. */
+  GMutex  frame_mutex;
+  GCond   frame_cond;
+  gboolean frame_ready;  /* protected by frame_mutex */
+  gboolean flushing;     /* protected by frame_mutex */
+  guint8  *frame_snapshot;
+  gint     fb_width;
+  gint     fb_height;
+  gsize    fb_size;      /* fb_width * fb_height * 4 */
 };
 
 GType gst_rfb_src_get_type (void);
+GST_ELEMENT_REGISTER_DECLARE (rfbsrc);
 
 G_END_DECLS
-#endif
+
+#endif /* __GST_RFB_SRC_H__ */

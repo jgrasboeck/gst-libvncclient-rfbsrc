@@ -25,54 +25,56 @@
 #endif
 
 #include "gstrfbsrc.h"
+#include "gstrfb-utils.h"
 
 #include <gst/video/video.h>
+#include <glib/gi18n-lib.h>
 
-#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
+
 #ifdef HAVE_X11
 #include <X11/Xlib.h>
 #endif
 
+/* Tag used as key for rfbClientSetClientData / rfbClientGetClientData */
+static gint rfb_client_key;
+
+#define DEFAULT_PROP_HOST         "127.0.0.1"
+#define DEFAULT_PROP_PORT         5900
+#define DEFAULT_PROP_URI          "rfb://"DEFAULT_PROP_HOST":"G_STRINGIFY(DEFAULT_PROP_PORT)
+
 enum
 {
   PROP_0,
+  PROP_URI,
   PROP_HOST,
   PROP_PORT,
-  PROP_USER,
   PROP_PASSWORD,
   PROP_OFFSET_X,
   PROP_OFFSET_Y,
   PROP_WIDTH,
   PROP_HEIGHT,
+  PROP_INCREMENTAL,
   PROP_SHARED,
+  PROP_VIEWONLY
 };
 
 GST_DEBUG_CATEGORY_STATIC (rfbsrc_debug);
-GST_DEBUG_CATEGORY (rfbdecoder_debug);
 #define GST_CAT_DEFAULT rfbsrc_debug
 
+/* Always produce BGRx (32-bit, B=byte0 G=byte1 R=byte2 x=byte3, LE).
+ * libvncclient is told to use this exact layout via client->format before
+ * connecting, so no runtime format detection is needed. */
 static GstStaticPadTemplate gst_rfb_src_template =
     GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
     GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("RGB")
-        "; " GST_VIDEO_CAPS_MAKE ("BGR")
-        "; " GST_VIDEO_CAPS_MAKE ("RGBx")
-        "; " GST_VIDEO_CAPS_MAKE ("BGRx")
-        "; " GST_VIDEO_CAPS_MAKE ("xRGB")
-        "; " GST_VIDEO_CAPS_MAKE ("xBGR")));
+    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("BGRx")));
 
-/*
- * Unique address used as a key for rfbClientSetClientData / rfbClientGetClientData
- * to store the GstRfbSrc* pointer so auth callbacks can retrieve it.
- */
-static gint rfb_src_client_data_key;
-
-/* Forward declaration needed by stop() and finalize() which retrieve the
- * received_update pointer using process_update as the key. */
-static void process_update (rfbClient * cl, int x, int y, int w, int h);
+/* ------------------------------------------------------------------ */
+/* Forward declarations                                                 */
+/* ------------------------------------------------------------------ */
 
 static void gst_rfb_src_finalize (GObject * object);
 static void gst_rfb_src_set_property (GObject * object, guint prop_id,
@@ -80,241 +82,104 @@ static void gst_rfb_src_set_property (GObject * object, guint prop_id,
 static void gst_rfb_src_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
 
-static gboolean gst_rfb_src_start (GstBaseSrc * bsrc);
 static gboolean gst_rfb_src_negotiate (GstBaseSrc * bsrc);
 static gboolean gst_rfb_src_stop (GstBaseSrc * bsrc);
+static gboolean gst_rfb_src_event (GstBaseSrc * bsrc, GstEvent * event);
 static gboolean gst_rfb_src_unlock (GstBaseSrc * bsrc);
 static gboolean gst_rfb_src_unlock_stop (GstBaseSrc * bsrc);
-static gboolean gst_rfb_src_event (GstBaseSrc * bsrc, GstEvent * event);
 static gboolean gst_rfb_src_decide_allocation (GstBaseSrc * bsrc,
     GstQuery * query);
 static GstFlowReturn gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf);
-static void gst_rfb_got_cursor_shape (rfbClient * cl, int xhot, int yhot,
-    int width, int height, int bpp);
-static rfbBool gst_rfb_handle_cursor_pos (rfbClient * cl, int x, int y);
+
+static void gst_rfb_src_uri_handler_init (gpointer g_iface,
+    gpointer iface_data);
+static gboolean gst_rfb_src_uri_set_uri (GstURIHandler * handler,
+    const gchar * uri, GError ** error);
 
 #define gst_rfb_src_parent_class parent_class
-G_DEFINE_TYPE (GstRfbSrc, gst_rfb_src, GST_TYPE_PUSH_SRC);
+G_DEFINE_TYPE_WITH_CODE (GstRfbSrc, gst_rfb_src, GST_TYPE_PUSH_SRC,
+    G_IMPLEMENT_INTERFACE (GST_TYPE_URI_HANDLER, gst_rfb_src_uri_handler_init));
+GST_ELEMENT_REGISTER_DEFINE (rfbsrc, "rfbsrc", GST_RANK_NONE,
+    GST_TYPE_RFB_SRC);
 
-/* ---------------------------------------------------------------------------
- * libvncclient log redirection
- *
- * rfbClientLog / rfbClientErr are global function pointers in libvncclient.
- * We replace them in plugin_init() so all VNC library output goes through
- * GStreamer's debug system under the "rfbdecoder" category, consistent with
- * how this plugin's own messages are handled.
- * --------------------------------------------------------------------------- */
-
-static void
-gst_rfb_vnc_log (const char *format, ...)
-{
-  va_list args;
-  gchar *msg;
-
-  va_start (args, format);
-  msg = g_strdup_vprintf (format, args);
-  va_end (args);
-
-  g_strchomp (msg);
-  GST_CAT_DEBUG (rfbdecoder_debug, "%s", msg);
-  g_free (msg);
-}
-
-static void
-gst_rfb_vnc_err (const char *format, ...)
-{
-  va_list args;
-  gchar *msg;
-
-  va_start (args, format);
-  msg = g_strdup_vprintf (format, args);
-  va_end (args);
-
-  g_strchomp (msg);
-  GST_CAT_WARNING (rfbdecoder_debug, "%s", msg);
-  g_free (msg);
-}
-
-/* ---------------------------------------------------------------------------
- * Authentication callbacks
- *
- * libvncclient calls these during InitialiseRFBConnection() when the server
- * requires a password or username+password.  We retrieve the credentials
- * from the GstRfbSrc that was stored via rfbClientSetClientData().
- * --------------------------------------------------------------------------- */
-
-static char *
-gst_rfb_src_get_password (rfbClient * cl)
-{
-  GstRfbSrc *src = rfbClientGetClientData (cl, &rfb_src_client_data_key);
-  return g_strdup (src->pass ? src->pass : "");
-}
-
-static rfbCredential *
-gst_rfb_src_get_credential (rfbClient * cl, int credentialType)
-{
-  GstRfbSrc *src = rfbClientGetClientData (cl, &rfb_src_client_data_key);
-  rfbCredential *cred;
-
-  if (credentialType != rfbCredentialTypeUser) {
-    GST_ELEMENT_ERROR (src, RESOURCE, NOT_AUTHORIZED,
-        ("Unsupported VNC credential type %d", credentialType), (NULL));
-    return NULL;
-  }
-
-  cred = g_new0 (rfbCredential, 1);
-  cred->userCredential.username = g_strdup (src->user ? src->user : "");
-  cred->userCredential.password = g_strdup (src->pass ? src->pass : "");
-  return cred;
-}
-
-/* ---------------------------------------------------------------------------
- * Cursor callbacks (client-side software cursor blending)
- *
- * When the server supports cursor-shape encodings (XCursor / RichCursor),
- * it stops drawing the cursor into the framebuffer and instead sends shape
- * and position updates.  We store the received data and blend the cursor
- * onto every output frame in fill().  Both callbacks also increment
- * received_update so that fill()'s wait loop wakes up on cursor-only events.
- *
- * When the server does NOT support these encodings it draws the cursor
- * directly into the framebuffer and fires GotFrameBufferUpdate normally —
- * the fields below stay zero-initialised and the blending path is skipped.
- * --------------------------------------------------------------------------- */
-
-static void
-gst_rfb_got_cursor_shape (rfbClient * cl, int xhot, int yhot,
-    int width, int height, int bpp)
-{
-  GstRfbSrc *src = rfbClientGetClientData (cl, &rfb_src_client_data_key);
-  src->cursor_hot_x = xhot;
-  src->cursor_hot_y = yhot;
-  src->cursor_width = width;
-  src->cursor_height = height;
-
-  /* Determine contrasting outline colour by averaging the luminance of all
-   * opaque cursor pixels.  Dark cursor → white outline; light → black.
-   * Computed once here so fill() pays zero per-frame cost. */
-  guint64 luma_sum = 0;
-  gint opaque_count = 0;
-  for (gint i = 0; i < width * height; i++) {
-    if (cl->rcMask[i]) {
-      guint8 *px = cl->rcSource + i * bpp;
-      for (gint b = 0; b < bpp; b++)
-        luma_sum += px[b];
-      opaque_count++;
-    }
-  }
-  guint8 avg = (opaque_count > 0) ? (guint8) (luma_sum / (opaque_count * bpp)) : 0;
-  guint8 outline_val = (avg < 128) ? 0xFF : 0x00;
-  for (gint b = 0; b < 4; b++)
-    src->cursor_outline_pixel[b] = outline_val;
-
-  /* Build 4-connected outline mask: transparent pixels inside the cursor rect
-   * that are adjacent to at least one opaque pixel.  These will be painted in
-   * the contrasting colour so the cursor edge is always legible. */
-  g_free (src->cursor_outline);
-  src->cursor_outline = g_new0 (guint8, width * height);
-  for (gint row = 0; row < height; row++) {
-    for (gint col = 0; col < width; col++) {
-      if (cl->rcMask[row * width + col])
-        continue;
-      if ((col > 0         && cl->rcMask[row * width + col - 1]) ||
-          (col < width - 1 && cl->rcMask[row * width + col + 1]) ||
-          (row > 0         && cl->rcMask[(row - 1) * width + col]) ||
-          (row < height - 1 && cl->rcMask[(row + 1) * width + col]))
-        src->cursor_outline[row * width + col] = 1;
-    }
-  }
-
-  gint *received_update = rfbClientGetClientData (cl, process_update);
-  g_atomic_int_inc (received_update);
-}
-
-static rfbBool
-gst_rfb_handle_cursor_pos (rfbClient * cl, int x, int y)
-{
-  GstRfbSrc *src = rfbClientGetClientData (cl, &rfb_src_client_data_key);
-  src->cursor_x = x;
-  src->cursor_y = y;
-  gint *received_update = rfbClientGetClientData (cl, process_update);
-  g_atomic_int_inc (received_update);
-  return TRUE;
-}
-
-/* ---------------------------------------------------------------------------
- * GObject / GstElement boilerplate
- * --------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* GObject boilerplate                                                  */
+/* ------------------------------------------------------------------ */
 
 static void
 gst_rfb_src_class_init (GstRfbSrcClass * klass)
 {
-  GObjectClass *gobject_class;
-  GstBaseSrcClass *gstbasesrc_class;
-  GstElementClass *gstelement_class;
-  GstPushSrcClass *gstpushsrc_class;
+  GObjectClass *gobject_class = (GObjectClass *) klass;
+  GstBaseSrcClass *gstbasesrc_class = (GstBaseSrcClass *) klass;
+  GstPushSrcClass *gstpushsrc_class = (GstPushSrcClass *) klass;
+  GstElementClass *gstelement_class = GST_ELEMENT_CLASS (klass);
 
   GST_DEBUG_CATEGORY_INIT (rfbsrc_debug, "rfbsrc", 0, "rfb src element");
-
-  gobject_class = (GObjectClass *) klass;
-  gstbasesrc_class = (GstBaseSrcClass *) klass;
-  gstpushsrc_class = (GstPushSrcClass *) klass;
 
   gobject_class->finalize = gst_rfb_src_finalize;
   gobject_class->set_property = gst_rfb_src_set_property;
   gobject_class->get_property = gst_rfb_src_get_property;
 
+  /**
+   * GstRfbSrc:uri:
+   *
+   * URI to an RFB server. All GStreamer parameters can be encoded in the URI.
+   *
+   * Since: 1.22
+   */
+  g_object_class_install_property (gobject_class, PROP_URI,
+      g_param_spec_string ("uri", "URI",
+          "URI in the form of rfb://host:port?query", DEFAULT_PROP_URI,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_HOST,
-      g_param_spec_string ("host", "Host to connect to", "Host to connect to",
-          "127.0.0.1", G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+      g_param_spec_string ("host", "Host", "VNC server hostname",
+          DEFAULT_PROP_HOST, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_PORT,
-      g_param_spec_int ("port", "Port", "Port",
-          1, 65535, 5900, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-  g_object_class_install_property (gobject_class, PROP_USER,
-      g_param_spec_string ("user", "Username for authentication",
-          "Username for authentication", "",
-          G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
+      g_param_spec_int ("port", "Port", "VNC server port",
+          1, 65535, DEFAULT_PROP_PORT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_PASSWORD,
-      g_param_spec_string ("password", "Password for authentication",
-          "Password for authentication", "",
-          G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
+      g_param_spec_string ("password", "Password", "VNC authentication password",
+          "", G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_OFFSET_X,
-      g_param_spec_int ("offset-x", "x offset for screen scrapping",
-          "x offset for screen scrapping", 0, 65535, 0,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+      g_param_spec_int ("offset-x", "Offset X", "Horizontal crop offset", 0,
+          65535, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_OFFSET_Y,
-      g_param_spec_int ("offset-y", "y offset for screen scrapping",
-          "y offset for screen scrapping", 0, 65535, 0,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+      g_param_spec_int ("offset-y", "Offset Y", "Vertical crop offset", 0,
+          65535, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_WIDTH,
-      g_param_spec_int ("width", "width of screen", "width of screen", 0, 65535,
+      g_param_spec_int ("width", "Width", "Capture width (0 = full)", 0, 65535,
           0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_HEIGHT,
-      g_param_spec_int ("height", "height of screen", "height of screen", 0,
+      g_param_spec_int ("height", "Height", "Capture height (0 = full)", 0,
           65535, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_INCREMENTAL,
+      g_param_spec_boolean ("incremental", "Incremental updates",
+          "Request incremental framebuffer updates", TRUE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property (gobject_class, PROP_SHARED,
-      g_param_spec_boolean ("shared", "Share desktop with other clients",
-          "Share desktop with other clients", 1,
+      g_param_spec_boolean ("shared", "Shared desktop",
+          "Allow concurrent connections to the VNC server", TRUE,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_VIEWONLY,
+      g_param_spec_boolean ("view-only", "View only",
+          "Disable sending input events to the VNC server", FALSE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
-  gstbasesrc_class->start = GST_DEBUG_FUNCPTR (gst_rfb_src_start);
   gstbasesrc_class->negotiate = GST_DEBUG_FUNCPTR (gst_rfb_src_negotiate);
   gstbasesrc_class->stop = GST_DEBUG_FUNCPTR (gst_rfb_src_stop);
+  gstbasesrc_class->event = GST_DEBUG_FUNCPTR (gst_rfb_src_event);
   gstbasesrc_class->unlock = GST_DEBUG_FUNCPTR (gst_rfb_src_unlock);
   gstbasesrc_class->unlock_stop = GST_DEBUG_FUNCPTR (gst_rfb_src_unlock_stop);
-  gstbasesrc_class->event = GST_DEBUG_FUNCPTR (gst_rfb_src_event);
-  gstpushsrc_class->fill = GST_DEBUG_FUNCPTR (gst_rfb_src_fill);
   gstbasesrc_class->decide_allocation =
       GST_DEBUG_FUNCPTR (gst_rfb_src_decide_allocation);
-
-  gstelement_class = GST_ELEMENT_CLASS (klass);
+  gstpushsrc_class->fill = GST_DEBUG_FUNCPTR (gst_rfb_src_fill);
 
   gst_element_class_add_static_pad_template (gstelement_class,
       &gst_rfb_src_template);
-
   gst_element_class_set_static_metadata (gstelement_class, "Rfb source",
       "Source/Video",
-      "Creates a rfb video stream",
+      "Connects to a VNC/RFB server and produces a video stream",
       "David A. Schleef <ds@schleef.org>, "
       "Andre Moreira Magalhaes <andre.magalhaes@indt.org.br>, "
       "Thijs Vermeir <thijsvermeir@gmail.com>");
@@ -329,11 +194,15 @@ gst_rfb_src_init (GstRfbSrc * src)
   gst_base_src_set_live (bsrc, TRUE);
   gst_base_src_set_format (bsrc, GST_FORMAT_TIME);
 
-  /* Authoritative defaults; applied to decoder in start() */
-  src->host = g_strdup ("127.0.0.1");
-  src->port = 5900;
+  src->uri = gst_uri_from_string (DEFAULT_PROP_URI);
+  src->host = g_strdup (DEFAULT_PROP_HOST);
+  src->port = DEFAULT_PROP_PORT;
+  src->incremental_update = TRUE;
   src->shared = TRUE;
-  /* offset_x, offset_y, width, height default to 0 — full framebuffer */
+  src->view_only = FALSE;
+
+  g_mutex_init (&src->frame_mutex);
+  g_cond_init (&src->frame_cond);
 }
 
 static void
@@ -341,28 +210,16 @@ gst_rfb_src_finalize (GObject * object)
 {
   GstRfbSrc *src = GST_RFB_SRC (object);
 
-  /* stop() should have been called by GStreamer before finalize, but guard. */
-  if (src->decoder) {
-    gint *received_update = rfbClientGetClientData (src->decoder, process_update);
-    g_free (received_update);
-    /* rfbClientCleanup() frees decoder->serverHost internally */
-    rfbClientCleanup (src->decoder);
-  }
-
+  if (src->uri)
+    gst_uri_unref (src->uri);
   g_free (src->host);
-  g_free (src->user);
-  g_free (src->pass);
-  g_free (src->cursor_outline);
+  g_free (src->password);
+  g_free (src->frame_snapshot);
+  g_mutex_clear (&src->frame_mutex);
+  g_cond_clear (&src->frame_cond);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
-
-/* ---------------------------------------------------------------------------
- * Property accessors
- *
- * All property values are stored in the GstRfbSrc struct so they can be set
- * before the element reaches PLAYING (i.e. before start() creates the decoder).
- * --------------------------------------------------------------------------- */
 
 static void
 gst_rfb_src_set_property (GObject * object, guint prop_id,
@@ -371,20 +228,20 @@ gst_rfb_src_set_property (GObject * object, guint prop_id,
   GstRfbSrc *src = GST_RFB_SRC (object);
 
   switch (prop_id) {
+    case PROP_URI:
+      gst_rfb_src_uri_set_uri ((GstURIHandler *) src,
+          g_value_get_string (value), NULL);
+      break;
     case PROP_HOST:
       g_free (src->host);
-      src->host = g_strdup (g_value_get_string (value));
+      src->host = g_value_dup_string (value);
       break;
     case PROP_PORT:
       src->port = g_value_get_int (value);
       break;
-    case PROP_USER:
-      g_free (src->user);
-      src->user = g_strdup (g_value_get_string (value));
-      break;
     case PROP_PASSWORD:
-      g_free (src->pass);
-      src->pass = g_strdup (g_value_get_string (value));
+      g_free (src->password);
+      src->password = g_value_dup_string (value);
       break;
     case PROP_OFFSET_X:
       src->offset_x = g_value_get_int (value);
@@ -393,13 +250,19 @@ gst_rfb_src_set_property (GObject * object, guint prop_id,
       src->offset_y = g_value_get_int (value);
       break;
     case PROP_WIDTH:
-      src->width = g_value_get_int (value);
+      src->req_width = g_value_get_int (value);
       break;
     case PROP_HEIGHT:
-      src->height = g_value_get_int (value);
+      src->req_height = g_value_get_int (value);
+      break;
+    case PROP_INCREMENTAL:
+      src->incremental_update = g_value_get_boolean (value);
       break;
     case PROP_SHARED:
       src->shared = g_value_get_boolean (value);
+      break;
+    case PROP_VIEWONLY:
+      src->view_only = g_value_get_boolean (value);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -414,6 +277,12 @@ gst_rfb_src_get_property (GObject * object, guint prop_id,
   GstRfbSrc *src = GST_RFB_SRC (object);
 
   switch (prop_id) {
+    case PROP_URI:
+      GST_OBJECT_LOCK (object);
+      g_value_take_string (value,
+          src->uri ? gst_uri_to_string (src->uri) : NULL);
+      GST_OBJECT_UNLOCK (object);
+      break;
     case PROP_HOST:
       g_value_set_string (value, src->host);
       break;
@@ -427,13 +296,19 @@ gst_rfb_src_get_property (GObject * object, guint prop_id,
       g_value_set_int (value, src->offset_y);
       break;
     case PROP_WIDTH:
-      g_value_set_int (value, src->width);
+      g_value_set_int (value, src->req_width);
       break;
     case PROP_HEIGHT:
-      g_value_set_int (value, src->height);
+      g_value_set_int (value, src->req_height);
+      break;
+    case PROP_INCREMENTAL:
+      g_value_set_boolean (value, src->incremental_update);
       break;
     case PROP_SHARED:
       g_value_set_boolean (value, src->shared);
+      break;
+    case PROP_VIEWONLY:
+      g_value_set_boolean (value, src->view_only);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -441,9 +316,9 @@ gst_rfb_src_get_property (GObject * object, guint prop_id,
   }
 }
 
-/* ---------------------------------------------------------------------------
- * Buffer pool allocation
- * --------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Buffer pool allocation                                               */
+/* ------------------------------------------------------------------ */
 
 static gboolean
 gst_rfb_src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
@@ -456,30 +331,24 @@ gst_rfb_src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
   gboolean ret;
 
   gst_query_parse_allocation (query, &caps, NULL);
-
   if (!caps || !gst_video_info_from_caps (&info, caps))
     return FALSE;
 
+  /* Require exact buffer size - we memcpy directly into the buffer */
   while (gst_query_get_n_allocation_pools (query) > 0) {
     gst_query_parse_nth_allocation_pool (query, 0, &pool, &size, &min, &max);
-
-    /* TODO We restrict to the exact size as we don't support strides or
-     * special padding */
     if (size == info.size)
       break;
-
     gst_query_remove_nth_allocation_pool (query, 0);
     gst_object_unref (pool);
     pool = NULL;
   }
 
   if (pool == NULL) {
-    /* we did not get a pool, make one ourselves then */
     pool = gst_video_buffer_pool_new ();
     size = info.size;
     min = 1;
     max = 0;
-
     if (gst_query_get_n_allocation_pools (query) > 0)
       gst_query_set_nth_allocation_pool (query, 0, pool, size, min, max);
     else
@@ -488,38 +357,519 @@ gst_rfb_src_decide_allocation (GstBaseSrc * bsrc, GstQuery * query)
 
   config = gst_buffer_pool_get_config (pool);
   gst_buffer_pool_config_set_params (config, caps, size, min, max);
-
   ret = gst_buffer_pool_set_config (pool, config);
   gst_object_unref (pool);
 
   return ret;
 }
 
-/* ---------------------------------------------------------------------------
- * Framebuffer update callback
- *
- * Called by libvncclient (from within HandleRFBServerMessage) each time the
- * server sends an updated rectangle.  We use an atomic counter as a simple
- * signal to fill() that new data is available.  Using g_atomic_int_inc avoids
- * the data race between the libvncclient call site and fill()'s reader.
- * --------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* libvncclient callbacks                                               */
+/* ------------------------------------------------------------------ */
 
-static void
-process_update (rfbClient * cl, int x, int y, int w, int h)
+/* Called by libvncclient to (re)allocate the remote framebuffer.
+ * On initial connect this runs on the negotiation thread before the
+ * background receiver thread is started, so mutex use is safe. */
+static rfbBool
+malloc_frame_buffer_cb (rfbClient * client)
 {
-  gint *received_update = rfbClientGetClientData (cl, process_update);
-  g_atomic_int_inc (received_update);
+  GstRfbSrc *src = rfbClientGetClientData (client, &rfb_client_key);
+  gsize new_size = (gsize) client->width * client->height * 4;
+
+  /* Server resize after initial connect - not fully supported yet */
+  if (src->fb_width > 0 &&
+      (src->fb_width != client->width || src->fb_height != client->height)) {
+    GST_WARNING_OBJECT (src,
+        "Server resize to %dx%d not supported; ignoring",
+        client->width, client->height);
+    g_free (client->frameBuffer);
+    client->frameBuffer = g_malloc (new_size);
+    return client->frameBuffer != NULL ? TRUE : FALSE;
+  }
+
+  g_free (client->frameBuffer);
+  client->frameBuffer = g_malloc (new_size);
+  if (!client->frameBuffer)
+    return FALSE;
+
+  g_mutex_lock (&src->frame_mutex);
+  src->fb_width = client->width;
+  src->fb_height = client->height;
+  src->fb_size = new_size;
+  g_free (src->frame_snapshot);
+  src->frame_snapshot = g_malloc (new_size);
+  g_mutex_unlock (&src->frame_mutex);
+
+  return src->frame_snapshot != NULL ? TRUE : FALSE;
 }
 
-/* ---------------------------------------------------------------------------
- * GstBaseSrc vmethod implementations
- * --------------------------------------------------------------------------- */
+/* Called by libvncclient when an individual rectangle has been updated.
+ * Used only for debug logging; the snapshot happens in finished_cb. */
+static void
+got_frame_buffer_update_cb (rfbClient * client, int x, int y, int w, int h)
+{
+  GstRfbSrc *src = rfbClientGetClientData (client, &rfb_client_key);
+  GST_LOG_OBJECT (src, "rect updated: %dx%d at (%d,%d)", w, h, x, y);
+}
+
+/* Called by libvncclient when the server has finished sending a complete
+ * FramebufferUpdate message (all rectangles received).  We snapshot the
+ * framebuffer under the mutex, signal fill(), and immediately request the
+ * next update so server-to-client latency stays minimal.
+ *
+ * Input events (SendPointerEvent / SendKeyEvent) are sent from
+ * gst_rfb_src_event on a different thread and never touch this path,
+ * so they are never blocked by frame reception. */
+static void
+finished_frame_buffer_update_cb (rfbClient * client)
+{
+  GstRfbSrc *src = rfbClientGetClientData (client, &rfb_client_key);
+  guint out_w, out_h;
+
+  if (!g_atomic_int_get (&src->running))
+    return;
+
+  out_w = src->req_width ? src->req_width : src->fb_width;
+  out_h = src->req_height ? src->req_height : src->fb_height;
+
+  g_mutex_lock (&src->frame_mutex);
+
+  if (src->frame_snapshot) {
+    if (out_w == (guint) src->fb_width && out_h == (guint) src->fb_height
+        && src->offset_x == 0 && src->offset_y == 0) {
+      /* Fast path: full framebuffer, single memcpy */
+      memcpy (src->frame_snapshot, client->frameBuffer, src->fb_size);
+    } else {
+      /* Sub-region crop: row-by-row copy */
+      guint stride = src->fb_width * 4;
+      const guint8 *s =
+          (const guint8 *) client->frameBuffer
+          + src->offset_y * stride + src->offset_x * 4;
+      guint8 *d = src->frame_snapshot;
+      guint row_bytes = out_w * 4;
+      for (guint y = 0; y < out_h; y++) {
+        memcpy (d, s, row_bytes);
+        s += stride;
+        d += row_bytes;
+      }
+    }
+    src->frame_ready = TRUE;
+    g_cond_signal (&src->frame_cond);
+  }
+
+  g_mutex_unlock (&src->frame_mutex);
+
+  /* Request the next update immediately for lowest end-to-end latency */
+  SendFramebufferUpdateRequest (client,
+      src->offset_x, src->offset_y,
+      out_w, out_h,
+      src->incremental_update ? TRUE : FALSE);
+}
+
+/* libvncclient calls this when VNC authentication requires a password */
+static char *
+get_password_cb (rfbClient * client)
+{
+  GstRfbSrc *src = rfbClientGetClientData (client, &rfb_client_key);
+  return strdup (src->password ? src->password : "");
+}
+
+/* ------------------------------------------------------------------ */
+/* Background receiver thread                                           */
+/* ------------------------------------------------------------------ */
+
+/* This thread owns all rfbProcessServerMessage calls.  Input events
+ * (SendPointerEvent / SendKeyEvent) are written to the socket from the
+ * event thread using libvncclient's internal send mutex, so they never
+ * stall waiting for a frame decode to finish. */
+static gpointer
+receiver_thread_func (gpointer data)
+{
+  GstRfbSrc *src = data;
+  rfbClient *client = src->client;
+
+  GST_DEBUG_OBJECT (src, "receiver thread started");
+
+  while (g_atomic_int_get (&src->running)) {
+    /* 50 ms timeout so we can react to running=0 within half a frame */
+    if (!rfbProcessServerMessage (client, 50 * 1000)) {
+      if (g_atomic_int_get (&src->running)) {
+        GST_ELEMENT_ERROR (src, RESOURCE, READ,
+            ("VNC connection lost to %s:%d", src->host, src->port), (NULL));
+        g_atomic_int_set (&src->running, 0);
+      }
+      break;
+    }
+  }
+
+  /* Unblock fill() if it is waiting for a frame */
+  g_mutex_lock (&src->frame_mutex);
+  g_cond_signal (&src->frame_cond);
+  g_mutex_unlock (&src->frame_mutex);
+
+  GST_DEBUG_OBJECT (src, "receiver thread exiting");
+  return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* GstBaseSrc / GstPushSrc vfuncs                                       */
+/* ------------------------------------------------------------------ */
+
+static gboolean
+gst_rfb_src_negotiate (GstBaseSrc * bsrc)
+{
+  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  rfbClient *client;
+  GstVideoInfo vinfo;
+  GstCaps *caps;
+  gchar *stream_id;
+  guint out_w, out_h;
+  int fake_argc = 0;
+
+  if (src->client)
+    return TRUE;
+
+  GST_DEBUG_OBJECT (src, "connecting to %s:%d", src->host, src->port);
+
+  /* rfbGetClient(bitsPerSample=8, samplesPerPixel=3, bytesPerPixel=4) */
+  client = rfbGetClient (8, 3, 4);
+  if (!client) {
+    GST_ELEMENT_ERROR (src, RESOURCE, OPEN_READ,
+        ("Failed to allocate VNC client"), (NULL));
+    return FALSE;
+  }
+
+  /* Back-pointer so callbacks can reach the GstRfbSrc */
+  rfbClientSetClientData (client, &rfb_client_key, src);
+
+  client->MallocFrameBuffer = malloc_frame_buffer_cb;
+  client->GotFrameBufferUpdate = got_frame_buffer_update_cb;
+  client->FinishedFrameBufferUpdate = finished_frame_buffer_update_cb;
+  client->GetPassword = get_password_cb;
+
+  client->serverHost = g_strdup (src->host);
+  client->serverPort = src->port;
+  client->appData.shareDesktop = src->shared ? TRUE : FALSE;
+  /* Disable server-side cursor - we want it composited into the framebuffer */
+  client->appData.useRemoteCursor = FALSE;
+  client->programName = "gst-rfbsrc";
+
+  /* Force BGRx pixel format so we always produce a known GstVideoFormat.
+   * Little-endian: B=byte0 (shift 0), G=byte1 (shift 8), R=byte2 (shift 16). */
+  client->format.bitsPerPixel = 32;
+  client->format.depth = 24;
+  client->format.bigEndian = FALSE;
+  client->format.trueColour = TRUE;
+  client->format.redMax = 255;
+  client->format.greenMax = 255;
+  client->format.blueMax = 255;
+  client->format.redShift = 16;
+  client->format.greenShift = 8;
+  client->format.blueShift = 0;
+
+  src->client = client;
+
+  /* rfbInitClient does the full handshake (version, auth, server init,
+   * SetPixelFormat, SetEncodings).  It calls malloc_frame_buffer_cb which
+   * sets src->fb_width / fb_height / fb_size / frame_snapshot. */
+  if (!rfbInitClient (client, &fake_argc, NULL)) {
+    /* rfbInitClient frees the client on failure */
+    src->client = NULL;
+    GST_ELEMENT_ERROR (src, RESOURCE, OPEN_READ,
+        ("Could not connect to VNC server %s:%d", src->host, src->port),
+        (NULL));
+    return FALSE;
+  }
+
+  /* Determine output dimensions (may be cropped) */
+  out_w = src->req_width ? MIN (src->req_width,
+      src->fb_width - (gint) src->offset_x) : src->fb_width - src->offset_x;
+  out_h = src->req_height ? MIN (src->req_height,
+      src->fb_height - (gint) src->offset_y) : src->fb_height - src->offset_y;
+
+  if (out_w == 0 || out_h == 0) {
+    GST_ELEMENT_ERROR (src, RESOURCE, OPEN_READ,
+        ("Invalid crop: offset (%u,%u) exceeds desktop %dx%d",
+            src->offset_x, src->offset_y, src->fb_width, src->fb_height),
+        (NULL));
+    rfbClientCleanup (client);
+    src->client = NULL;
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT (src, "desktop %dx%d, output %ux%u at offset (%u,%u)",
+      src->fb_width, src->fb_height, out_w, out_h,
+      src->offset_x, src->offset_y);
+
+  stream_id = gst_pad_create_stream_id_printf (GST_BASE_SRC_PAD (bsrc),
+      GST_ELEMENT (src), "%s:%d", src->host, src->port);
+  gst_pad_push_event (GST_BASE_SRC_PAD (bsrc),
+      gst_event_new_stream_start (stream_id));
+  g_free (stream_id);
+
+  gst_video_info_init (&vinfo);
+  gst_video_info_set_format (&vinfo, GST_VIDEO_FORMAT_BGRx, out_w, out_h);
+  caps = gst_video_info_to_caps (&vinfo);
+  gst_base_src_set_caps (bsrc, caps);
+  gst_caps_unref (caps);
+
+  /* Kick off the first update request (non-incremental = full frame) */
+  SendFramebufferUpdateRequest (client,
+      src->offset_x, src->offset_y, out_w, out_h, FALSE);
+
+  /* Start the background receiver thread */
+  g_atomic_int_set (&src->running, 1);
+  src->flushing = FALSE;
+  src->frame_ready = FALSE;
+  src->receiver_thread =
+      g_thread_new ("vnc-receiver", receiver_thread_func, src);
+
+  return TRUE;
+}
+
+static gboolean
+gst_rfb_src_stop (GstBaseSrc * bsrc)
+{
+  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+
+  /* Signal the receiver thread to stop */
+  g_atomic_int_set (&src->running, 0);
+
+  /* Unblock fill() in case it is waiting on the condvar */
+  g_mutex_lock (&src->frame_mutex);
+  g_cond_signal (&src->frame_cond);
+  g_mutex_unlock (&src->frame_mutex);
+
+  if (src->receiver_thread) {
+    g_thread_join (src->receiver_thread);
+    src->receiver_thread = NULL;
+  }
+
+  if (src->client) {
+    rfbClientCleanup (src->client);
+    src->client = NULL;
+  }
+
+  g_mutex_lock (&src->frame_mutex);
+  g_free (src->frame_snapshot);
+  src->frame_snapshot = NULL;
+  src->fb_width = 0;
+  src->fb_height = 0;
+  src->fb_size = 0;
+  src->frame_ready = FALSE;
+  src->flushing = FALSE;
+  g_mutex_unlock (&src->frame_mutex);
+
+  return TRUE;
+}
+
+/* gst_rfb_src_fill is the GStreamer streaming thread.
+ * It blocks on the condvar until the receiver thread (which runs
+ * rfbProcessServerMessage) completes a full FramebufferUpdate and signals.
+ * Because input events are sent directly via libvncclient's socket-write
+ * path (which has its own internal mutex), they are never serialised
+ * behind this wait. */
+static GstFlowReturn
+gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf)
+{
+  GstRfbSrc *src = GST_RFB_SRC (psrc);
+  GstMapInfo info;
+  guint out_w, out_h;
+  gsize expected;
+
+  g_mutex_lock (&src->frame_mutex);
+
+  while (!src->frame_ready && !src->flushing
+      && g_atomic_int_get (&src->running))
+    g_cond_wait (&src->frame_cond, &src->frame_mutex);
+
+  if (src->flushing) {
+    g_mutex_unlock (&src->frame_mutex);
+    return GST_FLOW_FLUSHING;
+  }
+
+  if (!g_atomic_int_get (&src->running) && !src->frame_ready) {
+    g_mutex_unlock (&src->frame_mutex);
+    return GST_FLOW_EOS;
+  }
+
+  out_w = src->req_width ? MIN (src->req_width,
+      src->fb_width - (gint) src->offset_x) : src->fb_width - src->offset_x;
+  out_h = src->req_height ? MIN (src->req_height,
+      src->fb_height - (gint) src->offset_y) : src->fb_height - src->offset_y;
+  expected = (gsize) out_w * out_h * 4;
+
+  if (!gst_buffer_map (outbuf, &info, GST_MAP_WRITE)) {
+    g_mutex_unlock (&src->frame_mutex);
+    GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
+        ("Could not map output buffer"), (NULL));
+    return GST_FLOW_ERROR;
+  }
+
+  if (G_LIKELY (info.size >= expected && src->frame_snapshot)) {
+    memcpy (info.data, src->frame_snapshot, expected);
+  } else {
+    GST_WARNING_OBJECT (src, "buffer size mismatch: have %" G_GSIZE_FORMAT
+        " need %" G_GSIZE_FORMAT, info.size, expected);
+  }
+
+  src->frame_ready = FALSE;
+  g_mutex_unlock (&src->frame_mutex);
+
+  GST_BUFFER_PTS (outbuf) =
+      gst_clock_get_time (GST_ELEMENT_CLOCK (src)) -
+      GST_ELEMENT_CAST (src)->base_time;
+
+  gst_buffer_unmap (outbuf, &info);
+  return GST_FLOW_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* Input event handling                                                 */
+/* ------------------------------------------------------------------ */
+
+#ifndef HAVE_X11
+/* Map GstNavigation key strings to X11 keysyms (used by the RFB protocol).
+ * For single printable ASCII/Latin-1 characters the keysym equals the
+ * Unicode codepoint; for special keys we use a static lookup table.
+ * libvncclient's own SendKeyEvent uses these same values. */
+static guint32
+key_string_to_keysym (const gchar * key)
+{
+  static const struct
+  {
+    const gchar *name;
+    guint32 keysym;
+  } table[] = {
+    /* clang-format off */
+    { "Return",      0xff0d }, { "BackSpace",   0xff08 }, { "Tab",         0xff09 },
+    { "Escape",      0xff1b }, { "Delete",      0xffff }, { "Insert",      0xff63 },
+    { "Home",        0xff50 }, { "End",         0xff57 }, { "Page_Up",     0xff55 },
+    { "Page_Down",   0xff56 }, { "Up",          0xff52 }, { "Down",        0xff54 },
+    { "Left",        0xff51 }, { "Right",       0xff53 }, { "space",       0x0020 },
+    { "F1",  0xffbe }, { "F2",  0xffbf }, { "F3",  0xffc0 }, { "F4",  0xffc1 },
+    { "F5",  0xffc2 }, { "F6",  0xffc3 }, { "F7",  0xffc4 }, { "F8",  0xffc5 },
+    { "F9",  0xffc6 }, { "F10", 0xffc7 }, { "F11", 0xffc8 }, { "F12", 0xffc9 },
+    { "Shift_L",     0xffe1 }, { "Shift_R",     0xffe2 },
+    { "Control_L",   0xffe3 }, { "Control_R",   0xffe4 },
+    { "Alt_L",       0xffe9 }, { "Alt_R",       0xffea },
+    { "Meta_L",      0xffe7 }, { "Meta_R",      0xffe8 },
+    { "Super_L",     0xffeb }, { "Super_R",     0xffec },
+    { "Caps_Lock",   0xffe5 }, { "Num_Lock",    0xff7f },
+    { "minus",       0x002d }, { "equal",       0x003d },
+    { "bracketleft", 0x005b }, { "bracketright",0x005d },
+    { "backslash",   0x005c }, { "semicolon",   0x003b },
+    { "apostrophe",  0x0027 }, { "grave",       0x0060 },
+    { "comma",       0x002c }, { "period",      0x002e }, { "slash", 0x002f },
+    { "Print",       0xff61 }, { "Scroll_Lock", 0xff14 }, { "Pause", 0xff13 },
+    /* clang-format on */
+    { NULL, 0 }
+  };
+
+  /* Single printable character: keysym == codepoint for Latin-1 range */
+  if (key[0] != '\0' && key[1] == '\0')
+    return (guchar) key[0];
+
+  for (int i = 0; table[i].name; i++) {
+    if (strcmp (key, table[i].name) == 0)
+      return table[i].keysym;
+  }
+
+  return 0;                     /* no match */
+}
+#endif /* !HAVE_X11 */
+
+/* gst_rfb_src_event is called from GStreamer's navigation infrastructure.
+ * SendPointerEvent and SendKeyEvent acquire libvncclient's internal send
+ * mutex and write directly to the socket, so they complete immediately
+ * regardless of what the receiver thread is doing. */
+static gboolean
+gst_rfb_src_event (GstBaseSrc * bsrc, GstEvent * event)
+{
+  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  GstNavigationEventType event_type;
+  gdouble x, y;
+  gint button;
+
+  if (GST_EVENT_TYPE (event) != GST_EVENT_NAVIGATION)
+    return TRUE;
+
+  if (src->view_only || !src->client)
+    return TRUE;
+
+  event_type = gst_navigation_event_get_type (event);
+
+  switch (event_type) {
+    case GST_NAVIGATION_EVENT_KEY_PRESS:
+    case GST_NAVIGATION_EVENT_KEY_RELEASE:{
+      const gchar *key = NULL;
+      guint32 keysym = 0;
+
+      gst_navigation_event_parse_key_event (event, &key);
+      if (!key)
+        break;
+
+#ifdef HAVE_X11
+      keysym = XStringToKeysym (key);
+#else
+      keysym = key_string_to_keysym (key);
+#endif
+      if (keysym != 0) {
+        GST_LOG_OBJECT (src, "key %s keysym=0x%x %s",
+            key, keysym,
+            event_type == GST_NAVIGATION_EVENT_KEY_PRESS ? "press" : "release");
+        SendKeyEvent (src->client, keysym,
+            event_type == GST_NAVIGATION_EVENT_KEY_PRESS ? TRUE : FALSE);
+      }
+      break;
+    }
+
+    case GST_NAVIGATION_EVENT_MOUSE_BUTTON_PRESS:
+      gst_navigation_event_parse_mouse_button_event (event, &button, &x, &y);
+      x += src->offset_x;
+      y += src->offset_y;
+      src->button_mask |= (1 << (button - 1));
+      GST_LOG_OBJECT (src, "mouse press btn=%d mask=%u x=%d y=%d",
+          button, src->button_mask, (gint) x, (gint) y);
+      SendPointerEvent (src->client, (gint) x, (gint) y, src->button_mask);
+      break;
+
+    case GST_NAVIGATION_EVENT_MOUSE_BUTTON_RELEASE:
+      gst_navigation_event_parse_mouse_button_event (event, &button, &x, &y);
+      x += src->offset_x;
+      y += src->offset_y;
+      src->button_mask &= ~(1 << (button - 1));
+      GST_LOG_OBJECT (src, "mouse release btn=%d mask=%u x=%d y=%d",
+          button, src->button_mask, (gint) x, (gint) y);
+      SendPointerEvent (src->client, (gint) x, (gint) y, src->button_mask);
+      break;
+
+    case GST_NAVIGATION_EVENT_MOUSE_MOVE:
+      gst_navigation_event_parse_mouse_move_event (event, &x, &y);
+      x += src->offset_x;
+      y += src->offset_y;
+      GST_LOG_OBJECT (src, "mouse move mask=%u x=%d y=%d",
+          src->button_mask, (gint) x, (gint) y);
+      SendPointerEvent (src->client, (gint) x, (gint) y, src->button_mask);
+      break;
+
+    default:
+      break;
+  }
+
+  return TRUE;
+}
 
 static gboolean
 gst_rfb_src_unlock (GstBaseSrc * bsrc)
 {
   GstRfbSrc *src = GST_RFB_SRC (bsrc);
-  g_atomic_int_set (&src->unlocked, 1);
+
+  g_mutex_lock (&src->frame_mutex);
+  src->flushing = TRUE;
+  g_cond_signal (&src->frame_cond);
+  g_mutex_unlock (&src->frame_mutex);
+
   return TRUE;
 }
 
@@ -527,340 +877,118 @@ static gboolean
 gst_rfb_src_unlock_stop (GstBaseSrc * bsrc)
 {
   GstRfbSrc *src = GST_RFB_SRC (bsrc);
-  g_atomic_int_set (&src->unlocked, 0);
+
+  g_mutex_lock (&src->frame_mutex);
+  src->flushing = FALSE;
+  g_mutex_unlock (&src->frame_mutex);
+
   return TRUE;
 }
 
-/*
- * start() — called on NULL→READY.
- *
- * Creates a fresh rfbClient from the stored property values.  This also makes
- * stop()+start() cycles safe: stop() destroys the decoder, start() recreates
- * it from the struct fields that survived.
- */
+/* ------------------------------------------------------------------ */
+/* URI handler                                                          */
+/* ------------------------------------------------------------------ */
+
+static GstURIType
+gst_rfb_src_uri_get_type (GType type)
+{
+  return GST_URI_SRC;
+}
+
+static const gchar *const *
+gst_rfb_src_uri_get_protocols (GType type)
+{
+  static const gchar *protocols[] = { "rfb", NULL };
+  return protocols;
+}
+
+static gchar *
+gst_rfb_src_uri_get_uri (GstURIHandler * handler)
+{
+  GstRfbSrc *src = (GstRfbSrc *) handler;
+  gchar *str;
+
+  GST_OBJECT_LOCK (src);
+  str = src->uri ? gst_uri_to_string (src->uri) : NULL;
+  GST_OBJECT_UNLOCK (src);
+
+  return str;
+}
+
 static gboolean
-gst_rfb_src_start (GstBaseSrc * bsrc)
+gst_rfb_src_uri_set_uri (GstURIHandler * handler, const gchar * str_uri,
+    GError ** error)
 {
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  GstRfbSrc *src = (GstRfbSrc *) handler;
+  GstUri *uri;
+  const gchar *userinfo;
 
-  /* 8 bits/sample, 3 samples (RGB), 4 bytes/pixel */
-  src->decoder = rfbGetClient (8, 3, 4);
-  src->decoder->serverHost = g_strdup (src->host);
-  src->decoder->serverPort = src->port;
-  src->decoder->canHandleNewFBSize = 0;
-  src->decoder->appData.useRemoteCursor = 1;
-  src->decoder->appData.shareDesktop = src->shared;
+  g_return_val_if_fail (str_uri != NULL, FALSE);
 
-  /* Override auth callbacks immediately after rfbGetClient() so the library's
-   * default (which may call getpass() on some versions) is never invoked. */
-  rfbClientSetClientData (src->decoder, &rfb_src_client_data_key, src);
-  src->decoder->GetPassword = gst_rfb_src_get_password;
-  src->decoder->GetCredential = gst_rfb_src_get_credential;
-
-  /* Request cursor shape/position encodings.  The server blends the cursor
-   * into the framebuffer only when it doesn't support these encodings, so
-   * we implement software blending ourselves as a complement. */
-  src->decoder->appData.useRemoteCursor = 1;
-  src->decoder->GotCursorShape = gst_rfb_got_cursor_shape;
-  src->decoder->HandleCursorPos = gst_rfb_handle_cursor_pos;
-
-  /* Reset software-cursor state for clean start / restart. */
-  src->cursor_x = src->cursor_y = 0;
-  src->cursor_hot_x = src->cursor_hot_y = 0;
-  src->cursor_width = src->cursor_height = 0;
-  g_free (src->cursor_outline);
-  src->cursor_outline = NULL;
-
-  /* Apply capture region only if the user set an explicit size.
-   * If not, updateRect stays zero and negotiate() will default to full frame. */
-  if (src->width > 0 && src->height > 0) {
-    src->decoder->updateRect.x = src->offset_x;
-    src->decoder->updateRect.y = src->offset_y;
-    src->decoder->updateRect.w = src->width;
-    src->decoder->updateRect.h = src->height;
-  }
-
-  return TRUE;
-}
-
-/*
- * negotiate() — called on READY→PAUSED.
- *
- * Connects to the VNC server, performs the RFB handshake (including
- * authentication), allocates the framebuffer, detects the pixel format, and
- * advertises the resulting GstCaps downstream.
- */
-static gboolean
-gst_rfb_src_negotiate (GstBaseSrc * bsrc)
-{
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
-  rfbClient *decoder;
-  GstCaps *caps;
-  GstVideoInfo vinfo;
-  GstVideoFormat vformat;
-  guint32 red_mask, green_mask, blue_mask;
-  gchar *stream_id = NULL;
-  GstEvent *stream_start = NULL;
-
-  decoder = src->decoder;
-
-  if (decoder->sock >= 0)
-    return TRUE;
-
-  GST_DEBUG_OBJECT (src, "connecting to host %s on port %d",
-      decoder->serverHost, decoder->serverPort);
-
-  if (!ConnectToRFBServer (decoder, decoder->serverHost, decoder->serverPort)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("Could not connect to VNC server %s on port %d",
-            decoder->serverHost, decoder->serverPort), (NULL));
+  if (GST_STATE (src) >= GST_STATE_PAUSED) {
+    g_set_error (error, GST_URI_ERROR, GST_URI_ERROR_BAD_STATE,
+        _("Changing the URI on rfbsrc while running is not supported"));
     return FALSE;
   }
 
-  if (!InitialiseRFBConnection (decoder)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("Failed to setup VNC connection to host %s on port %d",
-            decoder->serverHost, decoder->serverPort), (NULL));
+  if (!(uri = gst_uri_from_string (str_uri))) {
+    g_set_error (error, GST_URI_ERROR, GST_URI_ERROR_BAD_URI,
+        _("Invalid URI: %s"), str_uri);
     return FALSE;
   }
 
-  decoder->width = decoder->si.framebufferWidth;
-  decoder->height = decoder->si.framebufferHeight;
-  if (!decoder->MallocFrameBuffer (decoder)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("Failed to allocate VNC framebuffer for host %s on port %d",
-            decoder->serverHost, decoder->serverPort), (NULL));
+  if (g_strcmp0 (gst_uri_get_scheme (uri), "rfb") != 0) {
+    g_set_error (error, GST_URI_ERROR, GST_URI_ERROR_BAD_URI,
+        _("URI scheme must be 'rfb': %s"), str_uri);
+    gst_uri_unref (uri);
     return FALSE;
   }
 
-  /* Default to the full server framebuffer if no explicit region was set.
-   * The original code used (x < 0) as a sentinel, but rfbRectangle fields are
-   * unsigned so that check never triggered.  We test w/h == 0 instead, which
-   * is the zero-initialised default from rfbGetClient. */
-  if (decoder->updateRect.w == 0 || decoder->updateRect.h == 0) {
-    decoder->updateRect.x = 0;
-    decoder->updateRect.y = 0;
-    decoder->updateRect.w = decoder->width;
-    decoder->updateRect.h = decoder->height;
-  }
+  g_object_set (src, "host", gst_uri_get_host (uri), NULL);
+  g_object_set (src, "port", gst_uri_get_port (uri), NULL);
 
-  stream_id = gst_pad_create_stream_id_printf (GST_BASE_SRC_PAD (bsrc),
-      GST_ELEMENT (src), "%s:%d", decoder->serverHost, decoder->serverPort);
-  stream_start = gst_event_new_stream_start (stream_id);
-  g_free (stream_id);
-  gst_pad_push_event (GST_BASE_SRC_PAD (bsrc), stream_start);
-
-  GST_DEBUG_OBJECT (src, "setting caps width to %d and height to %d",
-      decoder->updateRect.w, decoder->updateRect.h);
-
-  red_mask = decoder->si.format.redMax << decoder->si.format.redShift;
-  green_mask = decoder->si.format.greenMax << decoder->si.format.greenShift;
-  blue_mask = decoder->si.format.blueMax << decoder->si.format.blueShift;
-
-  vformat = gst_video_format_from_masks (decoder->si.format.depth,
-      decoder->si.format.bitsPerPixel,
-      decoder->si.format.bigEndian ? G_BIG_ENDIAN : G_LITTLE_ENDIAN,
-      red_mask, green_mask, blue_mask, 0);
-  /* Lock in the server's native pixel format so fill() knows how to copy */
-  decoder->format = decoder->si.format;
-
-  gst_video_info_init (&vinfo);
-  gst_video_info_set_format (&vinfo, vformat,
-      decoder->updateRect.w, decoder->updateRect.h);
-  caps = gst_video_info_to_caps (&vinfo);
-  gst_base_src_set_caps (bsrc, caps);
-  gst_caps_unref (caps);
-
-  if (!SetFormatAndEncodings (decoder)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("Failed to set format/encodings for host %s on port %d",
-            decoder->serverHost, decoder->serverPort), (NULL));
-    return FALSE;
-  }
-
-  /* Allocate the atomic update counter and register the frame callback */
-  gint *received_update = g_new0 (gint, 1);
-  rfbClientSetClientData (decoder, process_update, received_update);
-  decoder->GotFrameBufferUpdate = process_update;
-
-  /* Prime the pump: ask the server for the first full frame */
-  SendFramebufferUpdateRequest (decoder,
-      decoder->updateRect.x, decoder->updateRect.y,
-      decoder->updateRect.w, decoder->updateRect.h,
-      FALSE);
-
-  return TRUE;
-}
-
-/*
- * stop() — called on PAUSED→READY (and on error paths).
- *
- * Frees all resources allocated in start()/negotiate().  After this returns,
- * src->decoder is NULL; a subsequent start() will recreate it cleanly.
- */
-static gboolean
-gst_rfb_src_stop (GstBaseSrc * bsrc)
-{
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
-
-  /* Free the update counter allocated in negotiate() before the decoder
-   * is destroyed — rfbClientCleanup() does not know about our client data. */
-  gint *received_update = rfbClientGetClientData (src->decoder, process_update);
-  g_free (received_update);
-
-  g_free (src->cursor_outline);
-  src->cursor_outline = NULL;
-
-  /* rfbClientCleanup() closes the socket and frees decoder->serverHost */
-  rfbClientCleanup (src->decoder);
-  src->decoder = NULL;
-
-  return TRUE;
-}
-
-/*
- * fill() — called repeatedly by GstPushSrc to produce video buffers.
- *
- * Waits for libvncclient to signal that a new frame is available (via the
- * process_update callback), then copies the capture region out of the shared
- * framebuffer into the output GstBuffer and requests the next incremental
- * update from the server.
- */
-static GstFlowReturn
-gst_rfb_src_fill (GstPushSrc * psrc, GstBuffer * outbuf)
-{
-  GstRfbSrc *src = GST_RFB_SRC (psrc);
-  rfbClient *decoder = src->decoder;
-  GstMapInfo info;
-  int bpp;
-  gsize expected_size;
-  int i;
-
-  /* Poll until the server sends an update.  WaitForMessage() blocks for up to
-   * 50 ms per call, HandleRFBServerMessage() processes the incoming data and
-   * triggers process_update(), which atomically increments the counter. */
-  gint *received_update = rfbClientGetClientData (decoder, process_update);
-  while (!g_atomic_int_get (received_update)) {
-    if (g_atomic_int_get (&src->unlocked))
-      return GST_FLOW_FLUSHING;
-    int ret = WaitForMessage (decoder, 50000);
-    if (ret < 0 || (ret > 0 && !HandleRFBServerMessage (decoder))) {
-      GST_ELEMENT_ERROR (src, RESOURCE, READ,
-          ("Error on VNC connection to host %s on port %d",
-              decoder->serverHost, decoder->serverPort), (NULL));
-      return GST_FLOW_ERROR;
+  userinfo = gst_uri_get_userinfo (uri);
+  if (userinfo) {
+    gchar **split = g_strsplit (userinfo, ":", 2);
+    if (split && split[0] && split[1]) {
+      gchar *pass = g_uri_unescape_string (split[1], NULL);
+      g_object_set (src, "password", pass, NULL);
+      g_free (pass);
     }
-  }
-  g_atomic_int_set (received_update, 0);
-
-  if (!gst_buffer_map (outbuf, &info, GST_MAP_WRITE)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
-        ("Could not map the output frame"), (NULL));
-    return GST_FLOW_ERROR;
+    g_strfreev (split);
   }
 
-  bpp = decoder->format.bitsPerPixel / 8;
-  expected_size = (gsize) decoder->updateRect.w * decoder->updateRect.h * bpp;
-  if (info.size < expected_size) {
-    gst_buffer_unmap (outbuf, &info);
-    GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
-        ("Output buffer too small: have %" G_GSIZE_FORMAT
-            ", need %" G_GSIZE_FORMAT, info.size, expected_size), (NULL));
-    return GST_FLOW_ERROR;
-  }
+  GST_OBJECT_LOCK (src);
+  if (src->uri)
+    gst_uri_unref (src->uri);
+  src->uri = gst_uri_ref (uri);
+  GST_OBJECT_UNLOCK (src);
 
-  /* Copy row-by-row from the capture sub-region of the full framebuffer */
-  for (i = 0; i < decoder->updateRect.h; i++) {
-    memcpy (&info.data[i * decoder->updateRect.w * bpp],
-        &decoder->frameBuffer[bpp * (decoder->updateRect.x +
-                (decoder->updateRect.y + i) * decoder->width)],
-        decoder->updateRect.w * bpp);
-  }
+  gst_rfb_utils_set_properties_from_uri_query (G_OBJECT (src), uri);
+  gst_uri_unref (uri);
 
-  /* Software cursor blending: active only when the server sent cursor-shape
-   * encodings (rcSource non-NULL).  When the server drew the cursor into the
-   * framebuffer itself this block is skipped. */
-  if (src->cursor_width > 0 && src->cursor_height > 0 && decoder->rcSource
-      && decoder->rcMask) {
-    /* Top-left corner of cursor in the capture-rect coordinate system */
-    int cx = src->cursor_x - src->cursor_hot_x - decoder->updateRect.x;
-    int cy = src->cursor_y - src->cursor_hot_y - decoder->updateRect.y;
-
-    for (int row = 0; row < src->cursor_height; row++) {
-      int fy = cy + row;
-      if (fy < 0 || fy >= decoder->updateRect.h)
-        continue;
-      for (int col = 0; col < src->cursor_width; col++) {
-        int fx = cx + col;
-        if (fx < 0 || fx >= decoder->updateRect.w)
-          continue;
-        int idx = row * src->cursor_width + col;
-        guint8 *dst = info.data + (fy * decoder->updateRect.w + fx) * bpp;
-        /* libvncclient stores rcMask as one byte per pixel (0=transparent, 1=opaque) */
-        if (decoder->rcMask[idx]) {
-          memcpy (dst, decoder->rcSource + idx * bpp, bpp);
-        } else if (src->cursor_outline && src->cursor_outline[idx]) {
-          /* Contrasting outline pixel — computed once in GotCursorShape */
-          memcpy (dst, src->cursor_outline_pixel, bpp);
-        }
-      }
-    }
-  }
-
-  GST_BUFFER_PTS (outbuf) =
-      gst_clock_get_time (GST_ELEMENT_CLOCK (src)) -
-      GST_ELEMENT_CAST (src)->base_time;
-
-  gst_buffer_unmap (outbuf, &info);
-
-  /* Ask the server for the next incremental update so the loop keeps running.
-   * Without this, RFC-compliant servers send nothing after the first frame. */
-  SendFramebufferUpdateRequest (decoder,
-      decoder->updateRect.x, decoder->updateRect.y,
-      decoder->updateRect.w, decoder->updateRect.h,
-      TRUE);                    /* TRUE = incremental */
-
-  return GST_FLOW_OK;
+  return TRUE;
 }
 
-static gboolean
-gst_rfb_src_event (GstBaseSrc * bsrc, GstEvent * event)
+static void
+gst_rfb_src_uri_handler_init (gpointer g_iface, gpointer iface_data)
 {
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  GstURIHandlerInterface *iface = (GstURIHandlerInterface *) g_iface;
 
-  switch (GST_EVENT_TYPE (event)) {
-    case GST_EVENT_FLUSH_STOP:
-      /* After flushing, request a full non-incremental frame so the first
-       * buffer pushed after the flush is complete. */
-      if (src->decoder && src->decoder->sock >= 0) {
-        SendFramebufferUpdateRequest (src->decoder,
-            src->decoder->updateRect.x, src->decoder->updateRect.y,
-            src->decoder->updateRect.w, src->decoder->updateRect.h,
-            FALSE);
-      }
-      break;
-    default:
-      break;
-  }
-
-  return GST_BASE_SRC_CLASS (parent_class)->event (bsrc, event);
+  iface->get_type = gst_rfb_src_uri_get_type;
+  iface->get_protocols = gst_rfb_src_uri_get_protocols;
+  iface->get_uri = gst_rfb_src_uri_get_uri;
+  iface->set_uri = gst_rfb_src_uri_set_uri;
 }
+
+/* ------------------------------------------------------------------ */
+/* Plugin registration                                                  */
+/* ------------------------------------------------------------------ */
 
 static gboolean
 plugin_init (GstPlugin * plugin)
 {
-  /* Initialise the decoder debug category here so the VNC log callbacks can
-   * use it immediately — before any element instance is created. */
-  GST_DEBUG_CATEGORY_INIT (rfbdecoder_debug, "rfbdecoder", 0, "rfb decoder");
-
-  /* Redirect libvncclient's global log/error output through GStreamer's debug
-   * system.  This makes VNC protocol-level messages visible under the same
-   * GST_DEBUG infrastructure as the rest of the plugin. */
-  rfbClientLog = gst_rfb_vnc_log;
-  rfbClientErr = gst_rfb_vnc_err;
-
-  return gst_element_register (plugin, "rfbsrc", GST_RANK_NONE,
-      GST_TYPE_RFB_SRC);
+  return GST_ELEMENT_REGISTER (rfbsrc, plugin);
 }
 
 GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
