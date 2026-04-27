@@ -1,5 +1,4 @@
 /* GStreamer
- * Copyright (C) <2007> Thijs Vermeir <thijsvermeir@gmail.com>
  * Copyright (C) <2006> Andre Moreira Magalhaes <andre.magalhaes@indt.org.br>
  * Copyright (C) <2004> David A. Schleef <ds@schleef.org>
  * Copyright (C) <1999> Erik Walthinsen <omega@cse.ogi.edu>
@@ -25,18 +24,18 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstpushsrc.h>
-#include <gst/video/gstvideopool.h>
-
-#include <rfb/rfbclient.h>
+#include <gst/video/video.h>
 
 G_BEGIN_DECLS
+
+typedef struct _rfbClient rfbClient;
 
 #define GST_TYPE_RFB_SRC \
   (gst_rfb_src_get_type())
 #define GST_RFB_SRC(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_RFB_SRC,GstRfbSrc))
 #define GST_RFB_SRC_CLASS(klass) \
-  (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_RFB_SRC,GstRfbSrc))
+  (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_RFB_SRC,GstRfbSrcClass))
 #define GST_IS_RFB_SRC(obj) \
   (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_RFB_SRC))
 #define GST_IS_RFB_SRC_CLASS(klass) \
@@ -54,46 +53,51 @@ struct _GstRfbSrc
 {
   GstPushSrc element;
 
-  /* connection properties */
   GstUri *uri;
   gchar *host;
   gint port;
+  gchar *username;
   gchar *password;
+  gchar *version;
+  gchar *encodings;
 
-  /* stream properties */
+  gint offset_x;
+  gint offset_y;
+  gint requested_width;
+  gint requested_height;
+  gint output_x;
+  gint output_y;
+  gint output_width;
+  gint output_height;
+  gint server_width;
+  gint server_height;
+
   gboolean incremental_update;
-  gboolean view_only;
+  gboolean use_copyrect;
   gboolean shared;
-  guint offset_x;
-  guint offset_y;
-  guint req_width;   /* 0 = full desktop width */
-  guint req_height;  /* 0 = full desktop height */
+  gboolean view_only;
 
-  /* input state - only modified from the streaming/event thread */
+  gint max_framerate;
+  guint frame_timeout_ms;
+  guint connect_timeout;
+  guint read_timeout;
+
+  rfbClient *client;
+  GRecMutex client_lock;
+
+  gboolean connected;
+  gint unlocked;
+  gboolean frame_valid;
+  gboolean frame_dirty;
+  gboolean geometry_changed;
+  gboolean have_caps;
+
   guint button_mask;
 
-  /* libvncclient handle - valid between negotiate and stop */
-  rfbClient *client;
-
-  /* background receiver thread drives rfbProcessServerMessage;
-   * input events (SendPointerEvent / SendKeyEvent) are sent directly
-   * from gst_rfb_src_event and never blocked by frame reception */
-  GThread   *receiver_thread;
-  gint       running;   /* g_atomic_int, 1 while receiver loop is alive */
-
-  /* frame double-buffer:
-   *   receiver thread writes client->frameBuffer (libvncclient-managed),
-   *   FinishedFrameBufferUpdate snapshots it into frame_snapshot under mutex,
-   *   gst_rfb_src_fill reads frame_snapshot under mutex.
-   *   Input events bypass this path entirely. */
-  GMutex  frame_mutex;
-  GCond   frame_cond;
-  gboolean frame_ready;  /* protected by frame_mutex */
-  gboolean flushing;     /* protected by frame_mutex */
-  guint8  *frame_snapshot;
-  gint     fb_width;
-  gint     fb_height;
-  gsize    fb_size;      /* fb_width * fb_height * 4 */
+  GstVideoInfo vinfo;
+  GstClockTime frame_duration;
+  GstClockTime last_frame_time;
+  GstClockTime next_pts;
 };
 
 GType gst_rfb_src_get_type (void);
@@ -101,4 +105,4 @@ GST_ELEMENT_REGISTER_DECLARE (rfbsrc);
 
 G_END_DECLS
 
-#endif /* __GST_RFB_SRC_H__ */
+#endif
