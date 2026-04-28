@@ -980,7 +980,7 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
     }
 
     remaining = (need_first_frame ? timeout_deadline : deadline) - now;
-    wait_usecs = (guint) MIN (remaining / GST_USECOND, (GstClockTime) 100000);
+    wait_usecs = (guint) MIN (remaining / GST_USECOND, (GstClockTime) 10000);
     if (wait_usecs == 0)
       wait_usecs = 1;
 
@@ -1015,6 +1015,17 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
           return FALSE;
       }
       need_first_frame = !src->frame_valid;
+
+      /* HandleRFBServerMessage can hold the lock for tens of ms while
+       * decompressing framebuffer data.  Yield here so input-event signal
+       * handlers (send-pointer, send-key) that arrived during that window
+       * get an immediate scheduling point rather than waiting another full
+       * WaitForMessage cycle. */
+      g_rec_mutex_unlock (&src->client_lock);
+      g_rec_mutex_lock (&src->client_lock);
+
+      if (gst_rfb_src_is_unlocked (src))
+        return FALSE;
     }
   }
 }
@@ -1051,32 +1062,13 @@ gst_rfb_src_maybe_fallback_cursor (GstRfbSrc * src)
         "could not renegotiate server-drawn cursor fallback");
 }
 
-static gboolean
-gst_rfb_src_cursor_mask_is_opaque (GstRfbSrc * src, gint x, gint y)
-{
-  gsize mask_offset;
-
-  if (src->cursor_mask == NULL)
-    return TRUE;
-
-  /* libvncclient expands the packed RFB 1bpp mask to one byte per pixel */
-  mask_offset = (gsize) y * src->cursor_width + x;
-  if (mask_offset >= src->cursor_mask_size)
-    return FALSE;
-
-  return src->cursor_mask[mask_offset] != 0;
-}
-
 static void
 gst_rfb_src_draw_cursor (GstRfbSrc * src, GstMapInfo * map,
     gsize output_stride)
 {
-  gint rel_x;
-  gint rel_y;
-  gint start_x;
-  gint start_y;
-  gint end_x;
-  gint end_y;
+  gint rel_x, rel_y;
+  gint start_x, start_y, end_x, end_y;
+  gsize src_bpp;
   gint y;
 
   if (!gst_rfb_src_cursor_is_usable (src))
@@ -1098,34 +1090,30 @@ gst_rfb_src_draw_cursor (GstRfbSrc * src, GstMapInfo * map,
   if (start_x >= end_x || start_y >= end_y)
     return;
 
+  /* Clamp logic above guarantees src and dst offsets stay in bounds. */
+  src_bpp = (gsize) src->cursor_bpp;
+
   for (y = start_y; y < end_y; y++) {
+    /* Hoist per-row pointers out of the inner loop. */
+    const guint8 *src_px = src->cursor_source
+        + (gsize) y * src->cursor_width * src_bpp
+        + (gsize) start_x * src_bpp;
+    guint8 *dst_px = (guint8 *) map->data
+        + (gsize) (rel_y + y) * output_stride
+        + (gsize) (rel_x + start_x) * 4;
+    /* libvncclient expands the packed RFB 1bpp mask to one byte per pixel. */
+    const guint8 *mask_row = src->cursor_mask
+        ? src->cursor_mask + (gsize) y * src->cursor_width : NULL;
     gint x;
 
-    for (x = start_x; x < end_x; x++) {
-      gsize source_offset;
-      gsize dest_offset;
-      const guint8 *source_pixel;
-      guint8 *dest_pixel;
-
-      if (!gst_rfb_src_cursor_mask_is_opaque (src, x, y))
+    for (x = start_x; x < end_x; x++, src_px += src_bpp, dst_px += 4) {
+      if (mask_row && mask_row[x] == 0)
         continue;
 
-      source_offset = ((gsize) y * src->cursor_width + x) *
-          src->cursor_bpp;
-      dest_offset = (gsize) (rel_y + y) * output_stride +
-          (gsize) (rel_x + x) * 4;
-
-      if (source_offset + src->cursor_bpp > src->cursor_source_size ||
-          dest_offset + 4 > map->size)
-        continue;
-
-      source_pixel = src->cursor_source + source_offset;
-      dest_pixel = map->data + dest_offset;
-
-      dest_pixel[0] = source_pixel[0];
-      dest_pixel[1] = source_pixel[1];
-      dest_pixel[2] = source_pixel[2];
-      dest_pixel[3] = 0xff;
+      dst_px[0] = src_px[0];
+      dst_px[1] = src_px[1];
+      dst_px[2] = src_px[2];
+      dst_px[3] = 0xff;
     }
   }
 }
