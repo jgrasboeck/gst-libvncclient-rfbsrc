@@ -969,7 +969,18 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
     if (wait_usecs == 0)
       wait_usecs = 1;
 
+    /* Release the lock while blocking so that signal handlers (send-pointer,
+     * send-key, …) from other threads can send input events to the server.
+     * TCP full-duplex makes concurrent read-wait and write safe.  The lock is
+     * always re-acquired before we touch any src fields or call
+     * HandleRFBServerMessage. */
+    g_rec_mutex_unlock (&src->client_lock);
     ret = WaitForMessage (src->client, wait_usecs);
+    g_rec_mutex_lock (&src->client_lock);
+
+    if (gst_rfb_src_is_unlocked (src))
+      return FALSE;
+
     if (ret < 0) {
       GST_ELEMENT_ERROR (src, RESOURCE, READ,
           ("Error while waiting for VNC server message"), (NULL));
