@@ -491,7 +491,7 @@ gst_rfb_src_malloc_framebuffer (rfbClient * client)
     src->server_height = client->height;
     src->geometry_changed = TRUE;
     src->frame_valid = FALSE;
-    src->frame_dirty = FALSE;
+    g_atomic_int_set (&src->frame_dirty, FALSE);
   }
 
   return GST_RFB_TRUE;
@@ -508,7 +508,7 @@ gst_rfb_src_got_framebuffer_update (rfbClient * client, int x, int y,
 
   GST_LOG_OBJECT (src, "framebuffer update x=%d y=%d width=%d height=%d",
       x, y, width, height);
-  src->frame_dirty = TRUE;
+  g_atomic_int_set (&src->frame_dirty, TRUE);
   src->frame_valid = TRUE;
   src->update_request_pending = FALSE;
 }
@@ -536,11 +536,11 @@ gst_rfb_src_clear_cursor (GstRfbSrc * src)
   src->cursor_source_size = 0;
   src->cursor_mask_size = 0;
   src->cursor_shape_valid = FALSE;
-  src->cursor_position_valid = FALSE;
+  g_atomic_int_set (&src->cursor_position_valid, FALSE);
   src->cursor_client_requested = FALSE;
   src->cursor_auto_fallback_frames = 0;
-  src->cursor_x = 0;
-  src->cursor_y = 0;
+  g_atomic_int_set (&src->cursor_x, 0);
+  g_atomic_int_set (&src->cursor_y, 0);
   src->cursor_hot_x = 0;
   src->cursor_hot_y = 0;
   src->cursor_width = 0;
@@ -556,10 +556,10 @@ gst_rfb_src_handle_cursor_pos (rfbClient * client, int x, int y)
   if (src == NULL)
     return GST_RFB_TRUE;
 
-  src->cursor_x = x;
-  src->cursor_y = y;
-  src->cursor_position_valid = TRUE;
-  src->frame_dirty = TRUE;
+  g_atomic_int_set (&src->cursor_x, x);
+  g_atomic_int_set (&src->cursor_y, y);
+  g_atomic_int_set (&src->cursor_position_valid, TRUE);
+  g_atomic_int_set (&src->frame_dirty, TRUE);
 
   GST_LOG_OBJECT (src, "cursor position x=%d y=%d", x, y);
 
@@ -618,7 +618,7 @@ gst_rfb_src_got_cursor_shape (rfbClient * client, int xhot, int yhot,
   src->cursor_bpp = bytes_per_pixel;
   src->cursor_shape_valid = TRUE;
   src->cursor_auto_fallback_frames = 0;
-  src->frame_dirty = TRUE;
+  g_atomic_int_set (&src->frame_dirty, TRUE);
 
   GST_DEBUG_OBJECT (src, "cursor shape %dx%d hot=%d,%d bpp=%d", width,
       height, xhot, yhot, bytes_per_pixel);
@@ -858,20 +858,24 @@ fail:
 static void
 gst_rfb_src_close (GstRfbSrc * src)
 {
+  /* Hold write_lock while nulling src->client so the input thread cannot
+   * start a Send* call with a pointer that is about to be freed. */
+  g_mutex_lock (&src->write_lock);
   if (src->client) {
     rfbClientCleanup (src->client);
     src->client = NULL;
   }
-
   src->connected = FALSE;
+  g_mutex_unlock (&src->write_lock);
+
   src->frame_valid = FALSE;
-  src->frame_dirty = FALSE;
+  g_atomic_int_set (&src->frame_dirty, FALSE);
   src->update_request_pending = FALSE;
   src->geometry_changed = FALSE;
   src->have_caps = FALSE;
   src->server_width = 0;
   src->server_height = 0;
-  src->button_mask = 0;
+  g_atomic_int_set (&src->button_mask, 0);
   g_clear_pointer (&src->active_encodings, g_free);
   gst_rfb_src_clear_cursor (src);
 }
@@ -889,15 +893,18 @@ gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
    * property controls whether *we* suppress unchanged output frames, not the
    * RFB protocol request type. */
   incremental = src->frame_valid;
-  src->frame_dirty = FALSE;
+  g_atomic_int_set (&src->frame_dirty, FALSE);
 
+  g_mutex_lock (&src->write_lock);
   if (!SendFramebufferUpdateRequest (src->client, src->output_x, src->output_y,
           src->output_width, src->output_height,
           incremental ? GST_RFB_TRUE : GST_RFB_FALSE)) {
+    g_mutex_unlock (&src->write_lock);
     GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
         ("Could not request VNC framebuffer update"), (NULL));
     return FALSE;
   }
+  g_mutex_unlock (&src->write_lock);
 
   src->update_request_pending = TRUE;
   GST_LOG_OBJECT (src, "sent %s framebuffer update request x=%d y=%d %dx%d",
@@ -949,7 +956,7 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
       /* In incremental (continuous) mode always emit on deadline.
        * In change-only mode only emit when the server actually sent new pixel
        * data; otherwise advance the deadline and keep polling. */
-      if (src->incremental_update || src->frame_dirty)
+      if (src->incremental_update || g_atomic_int_get (&src->frame_dirty))
         return TRUE;
       deadline = now + src->frame_duration;
     }
@@ -974,7 +981,7 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
     /* Change-only mode: if the server already answered with no changes and we
      * have not yet requested the next update, do so now so we do not stall. */
     if (!need_first_frame && !src->incremental_update &&
-        !src->update_request_pending && !src->frame_dirty) {
+        !src->update_request_pending && !g_atomic_int_get (&src->frame_dirty)) {
       if (!gst_rfb_src_send_framebuffer_update_request (src))
         return FALSE;
     }
@@ -1034,7 +1041,8 @@ static gboolean
 gst_rfb_src_cursor_is_usable (GstRfbSrc * src)
 {
   return src->cursor_client_requested &&
-      src->cursor_shape_valid && src->cursor_position_valid &&
+      src->cursor_shape_valid &&
+      g_atomic_int_get (&src->cursor_position_valid) &&
       src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_NONE;
 }
 
@@ -1043,7 +1051,8 @@ gst_rfb_src_maybe_fallback_cursor (GstRfbSrc * src)
 {
   if (src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_AUTO ||
       !src->cursor_client_requested ||
-      (src->cursor_shape_valid && src->cursor_position_valid))
+      (src->cursor_shape_valid &&
+          g_atomic_int_get (&src->cursor_position_valid)))
     return;
 
   src->cursor_auto_fallback_frames++;
@@ -1057,9 +1066,11 @@ gst_rfb_src_maybe_fallback_cursor (GstRfbSrc * src)
   src->cursor_client_requested = FALSE;
   src->client->appData.useRemoteCursor = GST_RFB_FALSE;
 
+  g_mutex_lock (&src->write_lock);
   if (!SetFormatAndEncodings (src->client))
     GST_WARNING_OBJECT (src,
         "could not renegotiate server-drawn cursor fallback");
+  g_mutex_unlock (&src->write_lock);
 }
 
 static void
@@ -1080,8 +1091,8 @@ gst_rfb_src_draw_cursor (GstRfbSrc * src, GstMapInfo * map,
     return;
   }
 
-  rel_x = src->cursor_x - src->cursor_hot_x - src->output_x;
-  rel_y = src->cursor_y - src->cursor_hot_y - src->output_y;
+  rel_x = g_atomic_int_get (&src->cursor_x) - src->cursor_hot_x - src->output_x;
+  rel_y = g_atomic_int_get (&src->cursor_y) - src->cursor_hot_y - src->output_y;
   start_x = MAX (0, -rel_x);
   start_y = MAX (0, -rel_y);
   end_x = MIN (src->cursor_width, src->output_width - rel_x);
@@ -1177,91 +1188,116 @@ gst_rfb_src_get_running_time (GstRfbSrc * src)
   return now;
 }
 
-static gboolean
-gst_rfb_src_send_key_locked (GstRfbSrc * src, guint keysym, gboolean down)
+/* ---------------------------------------------------------------------------
+ * Zero-latency input path
+ *
+ * Signal handlers (send-pointer, send-key, …) called from the application
+ * thread simply push an event onto input_queue and return immediately.  A
+ * dedicated input thread pops events and sends them under write_lock only —
+ * it never waits for client_lock, so VNC writes are never blocked by
+ * HandleRFBServerMessage.  SendPointerEvent / SendKeyEvent are pure TCP
+ * writes; running them concurrently with HandleRFBServerMessage's TCP read
+ * is safe on full-duplex sockets.  write_lock serialises concurrent sends
+ * (multiple app threads, or concurrent send + frame-thread write) and guards
+ * src->client from being freed during a send.
+ * ---------------------------------------------------------------------------
+ */
+
+typedef enum
 {
-  if (src->view_only) {
-    GST_LOG_OBJECT (src, "dropping key event in view-only mode");
-    return FALSE;
-  }
+  GST_RFB_INPUT_STOP,
+  GST_RFB_INPUT_POINTER,
+  GST_RFB_INPUT_KEY,
+  GST_RFB_INPUT_CLIPBOARD,
+} GstRfbInputType;
 
-  if (!src->connected || src->client == NULL) {
-    GST_WARNING_OBJECT (src, "dropping key event because VNC is not connected");
-    return FALSE;
-  }
-
-  if (keysym == 0) {
-    GST_WARNING_OBJECT (src, "dropping key event with empty keysym");
-    return FALSE;
-  }
-
-  return SendKeyEvent (src->client, keysym,
-      down ? GST_RFB_TRUE : GST_RFB_FALSE) ? TRUE : FALSE;
-}
-
-static gboolean
-gst_rfb_src_send_pointer_locked (GstRfbSrc * src, gint x, gint y,
-    guint button_mask)
+typedef struct
 {
-  gint remote_x;
-  gint remote_y;
+  GstRfbInputType type;
+  gint x, y;
+  guint button_mask;
+  guint keysym;
+  gboolean down;
+  gchar *text;
+  gint text_len;
+} GstRfbInputEvent;
 
-  if (src->view_only) {
-    GST_LOG_OBJECT (src, "dropping pointer event in view-only mode");
-    return FALSE;
+static gpointer
+gst_rfb_src_input_thread_func (gpointer data)
+{
+  GstRfbSrc *src = GST_RFB_SRC (data);
+  GstRfbInputEvent *ev;
+
+  while ((ev = g_async_queue_pop (src->input_queue)) != NULL) {
+    if (ev->type == GST_RFB_INPUT_STOP) {
+      g_free (ev);
+      break;
+    }
+
+    g_mutex_lock (&src->write_lock);
+
+    if (!src->connected || src->client == NULL) {
+      GST_LOG_OBJECT (src, "dropping queued input event: not connected");
+      g_mutex_unlock (&src->write_lock);
+      g_free (ev->text);
+      g_free (ev);
+      continue;
+    }
+
+    switch (ev->type) {
+      case GST_RFB_INPUT_POINTER:
+        GST_LOG_OBJECT (src, "sending pointer event x=%d y=%d mask=%u",
+            ev->x, ev->y, ev->button_mask);
+        SendPointerEvent (src->client, ev->x, ev->y, (int) ev->button_mask);
+        g_atomic_int_set (&src->cursor_x, ev->x);
+        g_atomic_int_set (&src->cursor_y, ev->y);
+        g_atomic_int_set (&src->cursor_position_valid, TRUE);
+        g_atomic_int_set (&src->frame_dirty, TRUE);
+        break;
+      case GST_RFB_INPUT_KEY:
+        SendKeyEvent (src->client, ev->keysym,
+            ev->down ? GST_RFB_TRUE : GST_RFB_FALSE);
+        break;
+      case GST_RFB_INPUT_CLIPBOARD:
+        SendClientCutText (src->client, ev->text, ev->text_len);
+        break;
+      default:
+        break;
+    }
+
+    g_mutex_unlock (&src->write_lock);
+    g_free (ev->text);
+    g_free (ev);
   }
 
-  if (!src->connected || src->client == NULL) {
-    GST_WARNING_OBJECT (src,
-        "dropping pointer event because VNC is not connected");
-    return FALSE;
-  }
-
-  remote_x = src->offset_x + x;
-  remote_y = src->offset_y + y;
-
-  if (src->client->width > 0)
-    remote_x = CLAMP (remote_x, 0, src->client->width - 1);
-  if (src->client->height > 0)
-    remote_y = CLAMP (remote_y, 0, src->client->height - 1);
-
-  src->button_mask = button_mask;
-  src->cursor_x = remote_x;
-  src->cursor_y = remote_y;
-  src->cursor_position_valid = TRUE;
-  src->frame_dirty = TRUE;
-
-  GST_LOG_OBJECT (src, "sending pointer event x=%d y=%d mask=%u",
-      remote_x, remote_y, button_mask);
-
-  return SendPointerEvent (src->client, remote_x, remote_y,
-      button_mask) ? TRUE : FALSE;
+  return NULL;
 }
 
 static gboolean
 gst_rfb_src_signal_send_key (GstRfbSrc * src, guint keysym, gboolean down)
 {
-  gboolean ret;
+  GstRfbInputEvent *ev;
 
-  g_rec_mutex_lock (&src->client_lock);
-  ret = gst_rfb_src_send_key_locked (src, keysym, down);
-  g_rec_mutex_unlock (&src->client_lock);
+  if (src->view_only || keysym == 0)
+    return FALSE;
 
-  return ret;
+  ev = g_new0 (GstRfbInputEvent, 1);
+  ev->type = GST_RFB_INPUT_KEY;
+  ev->keysym = keysym;
+  ev->down = down;
+  g_async_queue_push (src->input_queue, ev);
+  return TRUE;
 }
 
 static gboolean
 gst_rfb_src_signal_send_key_name (GstRfbSrc * src, const gchar * key,
     gboolean down)
 {
-  guint keysym;
-
-  keysym = gst_rfb_src_keysym_from_name (key);
+  guint keysym = gst_rfb_src_keysym_from_name (key);
   if (keysym == 0) {
     GST_WARNING_OBJECT (src, "unknown key name '%s'", GST_STR_NULL (key));
     return FALSE;
   }
-
   return gst_rfb_src_signal_send_key (src, keysym, down);
 }
 
@@ -1269,113 +1305,118 @@ static gboolean
 gst_rfb_src_signal_send_pointer (GstRfbSrc * src, gint x, gint y,
     guint button_mask)
 {
-  gboolean ret;
+  GstRfbInputEvent *ev;
 
-  g_rec_mutex_lock (&src->client_lock);
-  ret = gst_rfb_src_send_pointer_locked (src, x, y, button_mask);
-  g_rec_mutex_unlock (&src->client_lock);
+  if (src->view_only)
+    return FALSE;
 
-  return ret;
+  ev = g_new0 (GstRfbInputEvent, 1);
+  ev->type = GST_RFB_INPUT_POINTER;
+  ev->x = src->offset_x + x;
+  ev->y = src->offset_y + y;
+  ev->button_mask = button_mask;
+  g_async_queue_push (src->input_queue, ev);
+  return TRUE;
 }
 
 static gboolean
 gst_rfb_src_signal_send_mouse_button (GstRfbSrc * src, gint button,
     gboolean down, gint x, gint y)
 {
-  gboolean ret;
+  GstRfbInputEvent *ev;
   guint mask_bit;
+  guint new_mask;
 
   if (button < 1 || button > 8) {
     GST_WARNING_OBJECT (src, "invalid mouse button %d", button);
     return FALSE;
   }
 
+  if (src->view_only)
+    return FALSE;
+
   mask_bit = 1u << (button - 1);
+  /* Atomic read-modify-write so concurrent button events from multiple
+   * threads don't corrupt the mask. or/and return the OLD value. */
+  if (down) {
+    new_mask = (guint) g_atomic_int_or (&src->button_mask, (gint) mask_bit);
+    new_mask |= mask_bit;
+  } else {
+    new_mask = (guint) g_atomic_int_and (&src->button_mask, (gint) ~mask_bit);
+    new_mask &= ~mask_bit;
+  }
 
-  g_rec_mutex_lock (&src->client_lock);
-  if (down)
-    src->button_mask |= mask_bit;
-  else
-    src->button_mask &= ~mask_bit;
-
-  ret = gst_rfb_src_send_pointer_locked (src, x, y, src->button_mask);
-  g_rec_mutex_unlock (&src->client_lock);
-
-  return ret;
+  ev = g_new0 (GstRfbInputEvent, 1);
+  ev->type = GST_RFB_INPUT_POINTER;
+  ev->x = src->offset_x + x;
+  ev->y = src->offset_y + y;
+  ev->button_mask = new_mask;
+  g_async_queue_push (src->input_queue, ev);
+  return TRUE;
 }
 
 static gboolean
 gst_rfb_src_signal_send_text (GstRfbSrc * src, const gchar * text)
 {
   const gchar *p;
-  gboolean ret = TRUE;
 
-  if (text == NULL)
+  if (src->view_only || text == NULL)
     return FALSE;
 
-  g_rec_mutex_lock (&src->client_lock);
-
   for (p = text; *p != '\0'; p = g_utf8_next_char (p)) {
+    GstRfbInputEvent *ev_dn, *ev_up;
     gunichar ch;
     guint keysym;
 
     ch = g_utf8_get_char_validated (p, -1);
-    if (ch == (gunichar) - 1 || ch == (gunichar) - 2) {
-      ret = FALSE;
-      break;
-    }
+    if (ch == (gunichar) - 1 || ch == (gunichar) - 2)
+      return FALSE;
 
     keysym = gst_rfb_src_unicode_to_keysym (ch);
-    ret = gst_rfb_src_send_key_locked (src, keysym, TRUE) &&
-        gst_rfb_src_send_key_locked (src, keysym, FALSE);
-    if (!ret)
-      break;
+
+    ev_dn = g_new0 (GstRfbInputEvent, 1);
+    ev_dn->type = GST_RFB_INPUT_KEY;
+    ev_dn->keysym = keysym;
+    ev_dn->down = TRUE;
+    g_async_queue_push (src->input_queue, ev_dn);
+
+    ev_up = g_new0 (GstRfbInputEvent, 1);
+    ev_up->type = GST_RFB_INPUT_KEY;
+    ev_up->keysym = keysym;
+    ev_up->down = FALSE;
+    g_async_queue_push (src->input_queue, ev_up);
   }
-
-  g_rec_mutex_unlock (&src->client_lock);
-
-  return ret;
+  return TRUE;
 }
 
 static gboolean
 gst_rfb_src_signal_send_clipboard (GstRfbSrc * src, const gchar * text)
 {
-  gboolean ret;
-  gchar *latin1 = NULL;
+  GstRfbInputEvent *ev;
+  gchar *latin1;
   gsize bytes_written = 0;
   GError *error = NULL;
 
-  if (text == NULL)
+  if (src->view_only || text == NULL)
     return FALSE;
 
-  g_rec_mutex_lock (&src->client_lock);
-
-  if (src->view_only) {
-    ret = FALSE;
-  } else if (!src->connected || src->client == NULL) {
-    GST_WARNING_OBJECT (src,
-        "dropping clipboard event because VNC is not connected");
-    ret = FALSE;
-  } else {
-    /* Older LibVNCClient only exposes SendClientCutText(), whose payload is
-     * Latin-1. Keep the plugin linkable there and degrade non-Latin-1 chars. */
-    latin1 = g_convert_with_fallback (text, -1, "ISO-8859-1", "UTF-8", "?",
-        NULL, &bytes_written, &error);
-    if (latin1 == NULL) {
-      GST_WARNING_OBJECT (src, "could not convert clipboard text: %s",
-          error->message);
-      g_clear_error (&error);
-      ret = FALSE;
-    } else {
-      ret = SendClientCutText (src->client, latin1, (int) bytes_written) ?
-          TRUE : FALSE;
-      g_free (latin1);
-    }
+  /* Older LibVNCClient only exposes SendClientCutText(), whose payload is
+   * Latin-1. Keep the plugin linkable there and degrade non-Latin-1 chars. */
+  latin1 = g_convert_with_fallback (text, -1, "ISO-8859-1", "UTF-8", "?",
+      NULL, &bytes_written, &error);
+  if (latin1 == NULL) {
+    GST_WARNING_OBJECT (src, "could not convert clipboard text: %s",
+        error->message);
+    g_clear_error (&error);
+    return FALSE;
   }
 
-  g_rec_mutex_unlock (&src->client_lock);
-
-  return ret;
+  ev = g_new0 (GstRfbInputEvent, 1);
+  ev->type = GST_RFB_INPUT_CLIPBOARD;
+  ev->text = latin1;
+  ev->text_len = (gint) bytes_written;
+  g_async_queue_push (src->input_queue, ev);
+  return TRUE;
 }
 
 static void
@@ -1654,16 +1695,39 @@ gst_rfb_src_init (GstRfbSrc * src)
 
   gst_video_info_init (&src->vinfo);
   g_rec_mutex_init (&src->client_lock);
+  g_mutex_init (&src->write_lock);
+  src->input_queue = g_async_queue_new ();
+  src->input_thread = g_thread_new ("rfb-input",
+      gst_rfb_src_input_thread_func, src);
 }
 
 static void
 gst_rfb_src_finalize (GObject * object)
 {
   GstRfbSrc *src = GST_RFB_SRC (object);
+  GstRfbInputEvent *ev;
+  GstRfbInputEvent *stop_ev;
+
+  /* Drain any pending input events so the thread does not try to send
+   * them after the connection has been closed. */
+  while ((ev = g_async_queue_try_pop (src->input_queue)) != NULL) {
+    g_free (ev->text);
+    g_free (ev);
+  }
+
+  /* Signal the input thread to exit, then wait for it to finish any
+   * in-progress send before we tear down the connection. */
+  stop_ev = g_new0 (GstRfbInputEvent, 1);
+  stop_ev->type = GST_RFB_INPUT_STOP;
+  g_async_queue_push (src->input_queue, stop_ev);
+  g_thread_join (src->input_thread);
+  g_async_queue_unref (src->input_queue);
 
   g_rec_mutex_lock (&src->client_lock);
   gst_rfb_src_close (src);
   g_rec_mutex_unlock (&src->client_lock);
+
+  g_mutex_clear (&src->write_lock);
 
   if (src->uri)
     gst_uri_unref (src->uri);
@@ -1858,7 +1922,7 @@ gst_rfb_src_start (GstBaseSrc * bsrc)
   g_rec_mutex_lock (&src->client_lock);
   gst_rfb_src_set_unlocked (src, FALSE);
   src->frame_valid = FALSE;
-  src->frame_dirty = FALSE;
+  g_atomic_int_set (&src->frame_dirty, FALSE);
   src->geometry_changed = FALSE;
   src->update_request_pending = FALSE;
   src->last_frame_time = GST_CLOCK_TIME_NONE;
@@ -2007,7 +2071,7 @@ gst_rfb_src_event (GstBaseSrc * bsrc, GstEvent * event)
     case GST_NAVIGATION_EVENT_MOUSE_MOVE:
       if (gst_navigation_event_parse_mouse_move_event (event, &x, &y))
         gst_rfb_src_signal_send_pointer (src, (gint) x, (gint) y,
-            src->button_mask);
+            (guint) g_atomic_int_get (&src->button_mask));
       break;
     default:
       break;
