@@ -586,7 +586,8 @@ gst_rfb_src_got_cursor_shape (rfbClient * client, int xhot, int yhot,
   }
 
   source_size = (guint64) width * height * bytes_per_pixel;
-  mask_size = ((guint64) width + 7) / 8 * height;
+  /* libvncclient expands the packed RFB mask to one byte per pixel (0 or 1) */
+  mask_size = (guint64) width * height;
   if (source_size > G_MAXSIZE || mask_size > G_MAXSIZE ||
       client->rcSource == NULL) {
     GST_WARNING_OBJECT (src, "ignoring cursor shape with invalid buffers");
@@ -1053,18 +1054,17 @@ gst_rfb_src_maybe_fallback_cursor (GstRfbSrc * src)
 static gboolean
 gst_rfb_src_cursor_mask_is_opaque (GstRfbSrc * src, gint x, gint y)
 {
-  gsize mask_stride;
   gsize mask_offset;
 
   if (src->cursor_mask == NULL)
     return TRUE;
 
-  mask_stride = ((gsize) src->cursor_width + 7) / 8;
-  mask_offset = (gsize) y * mask_stride + (gsize) x / 8;
+  /* libvncclient expands the packed RFB 1bpp mask to one byte per pixel */
+  mask_offset = (gsize) y * src->cursor_width + x;
   if (mask_offset >= src->cursor_mask_size)
     return FALSE;
 
-  return (src->cursor_mask[mask_offset] & (0x80 >> (x & 7))) != 0;
+  return src->cursor_mask[mask_offset] != 0;
 }
 
 static void
