@@ -95,31 +95,19 @@ struct _GstRfbSrc
   rfbClient *client;
   GRecMutex client_lock;
 
-  /* Protects src->client and src->connected during VNC writes so the
-   * input thread can send pointer/key events concurrently with
-   * HandleRFBServerMessage (TCP full-duplex). Lock order when both are
-   * needed: client_lock first, then write_lock. */
-  GMutex write_lock;
-  GAsyncQueue *input_queue;
-  GThread *input_thread;
-
   gboolean connected;
   gint unlocked;
   gboolean frame_valid;
-  /* Accessed from both the frame thread and the input thread; use
-   * g_atomic_int_set/get for all reads and writes. */
-  gint frame_dirty;
+  gboolean frame_dirty;
   gboolean geometry_changed;
   gboolean have_caps;
   gboolean update_request_pending;
 
-  /* Read-modify-write from signal handlers; use g_atomic_int_or/and. */
-  gint button_mask;
+  guint button_mask;
 
   gboolean cursor_client_requested;
   gboolean cursor_shape_valid;
-  /* Atomically written by input thread and frame-thread callbacks. */
-  gint cursor_position_valid;
+  gboolean cursor_position_valid;
   gint cursor_auto_fallback_frames;
   gint cursor_x;
   gint cursor_y;
