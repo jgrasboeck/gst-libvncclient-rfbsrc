@@ -591,6 +591,27 @@ gst_rfb_src_open (GstRfbSrc * src)
     goto fail;
   }
 
+  if (client->width <= 0 || client->height <= 0) {
+    client->width = client->si.framebufferWidth;
+    client->height = client->si.framebufferHeight;
+  }
+
+  if (client->width <= 0 || client->height <= 0) {
+    GST_ELEMENT_ERROR (src, RESOURCE, READ,
+        ("VNC server reported invalid framebuffer size %dx%d",
+            client->width, client->height), (NULL));
+    g_free (effective_encodings);
+    goto fail;
+  }
+
+  if (client->frameBuffer == NULL && !client->MallocFrameBuffer (client)) {
+    GST_ELEMENT_ERROR (src, RESOURCE, NO_SPACE_LEFT,
+        ("Could not allocate %dx%d VNC framebuffer", client->width,
+            client->height), (NULL));
+    g_free (effective_encodings);
+    goto fail;
+  }
+
   if (!SetFormatAndEncodings (client)) {
     GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
         ("Could not send VNC pixel format/encodings to %s:%d", src->host,
