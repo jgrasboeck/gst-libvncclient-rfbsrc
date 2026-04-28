@@ -521,7 +521,9 @@ gst_rfb_src_finished_framebuffer_update (rfbClient * client)
   if (src == NULL)
     return;
 
-  src->frame_dirty = TRUE;
+  /* Do NOT set frame_dirty here — only GotFrameBufferUpdate (actual pixel
+   * changes) or cursor callbacks set it.  That way wait_for_frame can tell
+   * when the server replied with 0 rectangles (nothing changed). */
   src->frame_valid = TRUE;
   src->update_request_pending = FALSE;
 }
@@ -716,6 +718,7 @@ gst_rfb_src_sync_client_update_rect (GstRfbSrc * src)
   src->client->updateRect.y = src->output_y;
   src->client->updateRect.w = src->output_width;
   src->client->updateRect.h = src->output_height;
+  src->client->isUpdateRectManagedByLib = GST_RFB_FALSE;
 }
 
 static gboolean
@@ -881,7 +884,11 @@ gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
   if (src->update_request_pending)
     return TRUE;
 
-  incremental = src->frame_valid && src->incremental_update;
+  /* Always request incremental updates from the server after the first full
+   * frame so the server only sends changed rects.  The incremental_update
+   * property controls whether *we* suppress unchanged output frames, not the
+   * RFB protocol request type. */
+  incremental = src->frame_valid;
   src->frame_dirty = FALSE;
 
   if (!SendFramebufferUpdateRequest (src->client, src->output_x, src->output_y,
@@ -936,12 +943,26 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
       return TRUE;
 
     now = gst_util_get_timestamp ();
-    if (!need_first_frame && now >= deadline)
-      return TRUE;
+    if (!need_first_frame && now >= deadline) {
+      /* In incremental (continuous) mode always emit on deadline.
+       * In change-only mode only emit when the server actually sent new pixel
+       * data; otherwise advance the deadline and keep polling. */
+      if (src->incremental_update || src->frame_dirty)
+        return TRUE;
+      deadline = now + src->frame_duration;
+    }
     if (need_first_frame && now >= timeout_deadline) {
       GST_ELEMENT_ERROR (src, RESOURCE, READ,
           ("Timed out waiting for first VNC framebuffer update"), (NULL));
       return FALSE;
+    }
+
+    /* Change-only mode: if the server already answered with no changes and we
+     * have not yet requested the next update, do so now so we do not stall. */
+    if (!need_first_frame && !src->incremental_update &&
+        !src->update_request_pending && !src->frame_dirty) {
+      if (!gst_rfb_src_send_framebuffer_update_request (src))
+        return FALSE;
     }
 
     remaining = (need_first_frame ? timeout_deadline : deadline) - now;
@@ -1445,7 +1466,9 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_INCREMENTAL,
       g_param_spec_boolean ("incremental", "Incremental updates",
-          "Request incremental framebuffer updates after the first frame",
+          "When TRUE (default), emit output frames at max-framerate regardless "
+          "of whether the remote screen changed.  When FALSE, suppress output "
+          "frames when the server reports no pixel changes since the last frame.",
           TRUE, ready_flags));
 
   g_object_class_install_property (gobject_class, PROP_USE_COPYRECT,
