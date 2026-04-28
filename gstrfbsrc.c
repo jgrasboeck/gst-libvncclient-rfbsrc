@@ -58,7 +58,7 @@
 #define DEFAULT_PROP_VERSION          "auto"
 #define DEFAULT_PROP_ENCODINGS        "tight zrle hextile raw"
 #define DEFAULT_PROP_MAX_FRAMERATE    30
-#define DEFAULT_PROP_FRAME_TIMEOUT_MS 1000
+#define DEFAULT_PROP_FRAME_TIMEOUT_MS 5000
 #define DEFAULT_PROP_CONNECT_TIMEOUT  10
 #define DEFAULT_PROP_READ_TIMEOUT     10
 #define DEFAULT_PROP_CURSOR_MODE      GST_RFB_SRC_CURSOR_MODE_AUTO
@@ -912,6 +912,7 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
   GstClockTime now;
   GstClockTime deadline;
   GstClockTime timeout_deadline;
+  GstClockTime first_frame_retry_deadline;
   gboolean need_first_frame;
 
   need_first_frame = !src->frame_valid;
@@ -920,6 +921,7 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
   if (need_first_frame) {
     timeout_deadline = now + src->frame_timeout_ms * GST_MSECOND;
     deadline = timeout_deadline;
+    first_frame_retry_deadline = now + 500 * GST_MSECOND;
   } else if (GST_CLOCK_TIME_IS_VALID (src->last_frame_time)) {
     deadline = src->last_frame_time + src->frame_duration;
     timeout_deadline = now + src->frame_timeout_ms * GST_MSECOND;
@@ -954,6 +956,18 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
       GST_ELEMENT_ERROR (src, RESOURCE, READ,
           ("Timed out waiting for first VNC framebuffer update"), (NULL));
       return FALSE;
+    }
+
+    /* Some VNC servers silently drop or delay the first framebuffer update
+     * request.  Retry every 500 ms so we nudge the server into responding
+     * rather than waiting passively until the timeout expires. */
+    if (need_first_frame && now >= first_frame_retry_deadline) {
+      GST_DEBUG_OBJECT (src,
+          "no first frame yet, retrying framebuffer update request");
+      src->update_request_pending = FALSE;
+      if (!gst_rfb_src_send_framebuffer_update_request (src))
+        return FALSE;
+      first_frame_retry_deadline = now + 500 * GST_MSECOND;
     }
 
     /* Change-only mode: if the server already answered with no changes and we
