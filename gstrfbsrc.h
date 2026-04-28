@@ -101,6 +101,7 @@ struct _GstRfbSrc
   gboolean frame_dirty;
   gboolean geometry_changed;
   gboolean have_caps;
+  gboolean update_request_pending;
 
   guint button_mask;
 

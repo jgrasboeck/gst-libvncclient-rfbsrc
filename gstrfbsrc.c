@@ -510,6 +510,7 @@ gst_rfb_src_got_framebuffer_update (rfbClient * client, int x, int y,
       x, y, width, height);
   src->frame_dirty = TRUE;
   src->frame_valid = TRUE;
+  src->update_request_pending = FALSE;
 }
 
 static void
@@ -522,6 +523,7 @@ gst_rfb_src_finished_framebuffer_update (rfbClient * client)
 
   src->frame_dirty = TRUE;
   src->frame_valid = TRUE;
+  src->update_request_pending = FALSE;
 }
 
 static void
@@ -714,6 +716,7 @@ gst_rfb_src_sync_client_update_rect (GstRfbSrc * src)
   src->client->updateRect.y = src->output_y;
   src->client->updateRect.w = src->output_width;
   src->client->updateRect.h = src->output_height;
+  src->client->isUpdateRectManagedByLib = GST_RFB_FALSE;
 }
 
 static gboolean
@@ -861,6 +864,7 @@ gst_rfb_src_close (GstRfbSrc * src)
   src->connected = FALSE;
   src->frame_valid = FALSE;
   src->frame_dirty = FALSE;
+  src->update_request_pending = FALSE;
   src->geometry_changed = FALSE;
   src->have_caps = FALSE;
   src->server_width = 0;
@@ -875,6 +879,9 @@ gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
 {
   gboolean incremental;
 
+  if (src->update_request_pending)
+    return TRUE;
+
   incremental = src->frame_valid && src->incremental_update;
   src->frame_dirty = FALSE;
 
@@ -885,6 +892,11 @@ gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
         ("Could not request VNC framebuffer update"), (NULL));
     return FALSE;
   }
+
+  src->update_request_pending = TRUE;
+  GST_LOG_OBJECT (src, "sent %s framebuffer update request x=%d y=%d %dx%d",
+      incremental ? "incremental" : "full", src->output_x, src->output_y,
+      src->output_width, src->output_height);
 
   return TRUE;
 }
@@ -1814,6 +1826,7 @@ gst_rfb_src_start (GstBaseSrc * bsrc)
   src->frame_valid = FALSE;
   src->frame_dirty = FALSE;
   src->geometry_changed = FALSE;
+  src->update_request_pending = FALSE;
   src->last_frame_time = GST_CLOCK_TIME_NONE;
   src->next_pts = 0;
   g_rec_mutex_unlock (&src->client_lock);
