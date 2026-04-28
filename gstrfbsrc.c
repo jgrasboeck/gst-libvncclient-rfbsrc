@@ -105,9 +105,116 @@ enum
 
 static guint gst_rfb_src_signals[SIGNAL_LAST];
 static gint gst_rfb_src_client_data_tag;
+static GPrivate gst_rfb_src_active_log_src = G_PRIVATE_INIT (NULL);
 
 GST_DEBUG_CATEGORY_STATIC (rfbsrc_debug);
 #define GST_CAT_DEFAULT rfbsrc_debug
+
+static void
+gst_rfb_src_remember_libvnc_error (GstRfbSrc * src, const gchar * message)
+{
+  if (src == NULL || message == NULL || *message == '\0')
+    return;
+
+  if (src->last_libvnc_error) {
+    gchar *combined = g_strconcat (src->last_libvnc_error, "; ", message,
+        NULL);
+
+    g_free (src->last_libvnc_error);
+    src->last_libvnc_error = combined;
+  } else {
+    src->last_libvnc_error = g_strdup (message);
+  }
+}
+
+static gboolean
+gst_rfb_src_libvnc_message_contains (GstRfbSrc * src, const gchar * needle)
+{
+  gchar *message;
+  gboolean ret;
+
+  if (src->last_libvnc_error == NULL || needle == NULL)
+    return FALSE;
+
+  message = g_ascii_strdown (src->last_libvnc_error, -1);
+  ret = strstr (message, needle) != NULL;
+  g_free (message);
+
+  return ret;
+}
+
+static const gchar *
+gst_rfb_src_classify_initialise_failure (GstRfbSrc * src)
+{
+  if (gst_rfb_src_libvnc_message_contains (src, "auth") ||
+      gst_rfb_src_libvnc_message_contains (src, "password") ||
+      gst_rfb_src_libvnc_message_contains (src, "credential"))
+    return "authentication-failed";
+
+  if (gst_rfb_src_libvnc_message_contains (src, "security"))
+    return "security-negotiation-failed";
+
+  return "protocol-error";
+}
+
+static const gchar *
+gst_rfb_src_classify_io_failure (GstRfbSrc * src,
+    const gchar * default_reason)
+{
+  if (gst_rfb_src_libvnc_message_contains (src, "closed") ||
+      gst_rfb_src_libvnc_message_contains (src, "connection reset") ||
+      gst_rfb_src_libvnc_message_contains (src, "broken pipe") ||
+      gst_rfb_src_libvnc_message_contains (src, "eof"))
+    return "connection-lost";
+
+  if (gst_rfb_src_libvnc_message_contains (src, "timed out") ||
+      gst_rfb_src_libvnc_message_contains (src, "timeout"))
+    return "timeout";
+
+  return default_reason;
+}
+
+static void
+gst_rfb_src_post_resource_error (GstRfbSrc * src, GstResourceError code,
+    const gchar * stage, const gchar * reason, const gchar * format, ...)
+{
+  va_list args;
+  gchar *text;
+  gchar *debug;
+  GstStructure *details;
+  const gchar *libvnc_error;
+
+  va_start (args, format);
+  text = g_strdup_vprintf (format, args);
+  va_end (args);
+
+  libvnc_error = src->last_libvnc_error;
+  if (libvnc_error && *libvnc_error) {
+    debug = g_strdup_printf ("stage=%s reason=%s libvnc-error=%s",
+        stage, reason, libvnc_error);
+  } else {
+    debug = g_strdup_printf ("stage=%s reason=%s", stage, reason);
+  }
+
+  details = gst_structure_new ("rfbsrc-error",
+      "reason", G_TYPE_STRING, reason,
+      "stage", G_TYPE_STRING, stage,
+      "host", G_TYPE_STRING, src->host ? src->host : "",
+      "port", G_TYPE_INT, src->port, NULL);
+  if (libvnc_error && *libvnc_error) {
+    gst_structure_set (details,
+        "libvnc-error", G_TYPE_STRING, libvnc_error, NULL);
+  }
+
+  if (text)
+    GST_WARNING_OBJECT (src, "error: %s", text);
+  if (debug)
+    GST_WARNING_OBJECT (src, "error: %s", debug);
+
+  gst_element_message_full_with_details (GST_ELEMENT_CAST (src),
+      GST_MESSAGE_ERROR, GST_RESOURCE_ERROR, code, text, debug, __FILE__,
+      GST_FUNCTION, __LINE__, details);
+}
 
 static gchar *
 gst_rfb_src_format_libvnc_log (const char *format, va_list args)
@@ -142,13 +249,17 @@ gst_rfb_src_libvnc_err (const char *format, ...)
 {
   va_list args;
   gchar *message;
+  GstRfbSrc *src;
 
   va_start (args, format);
   message = gst_rfb_src_format_libvnc_log (format, args);
   va_end (args);
 
-  if (message && *message)
+  if (message && *message) {
+    src = g_private_get (&gst_rfb_src_active_log_src);
+    gst_rfb_src_remember_libvnc_error (src, message);
     GST_CAT_WARNING (rfbsrc_debug, "%s", message);
+  }
 
   g_free (message);
 }
@@ -632,18 +743,20 @@ gst_rfb_src_compute_output_rect (GstRfbSrc * src, gint * x, gint * y,
   gint max_height;
 
   if (src->server_width <= 0 || src->server_height <= 0) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("VNC server reported invalid framebuffer size %dx%d",
-            src->server_width, src->server_height), (NULL));
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+        "validate-geometry", "invalid-framebuffer-size",
+        "VNC server reported invalid framebuffer size %dx%d",
+        src->server_width, src->server_height);
     return FALSE;
   }
 
   if (src->offset_x < 0 || src->offset_x >= src->server_width ||
       src->offset_y < 0 || src->offset_y >= src->server_height) {
-    GST_ELEMENT_ERROR (src, RESOURCE, SETTINGS,
-        ("Capture offset %d,%d outside VNC framebuffer %dx%d",
-            src->offset_x, src->offset_y, src->server_width,
-            src->server_height), (NULL));
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
+        "validate-geometry", "capture-area-invalid",
+        "Capture offset %d,%d outside VNC framebuffer %dx%d",
+        src->offset_x, src->offset_y, src->server_width,
+        src->server_height);
     return FALSE;
   }
 
@@ -666,7 +779,14 @@ gst_rfb_src_compute_output_rect (GstRfbSrc * src, gint * x, gint * y,
     *height = max_height;
   }
 
-  return *width > 0 && *height > 0;
+  if (*width <= 0 || *height <= 0) {
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
+        "validate-geometry", "capture-area-invalid",
+        "Capture area %dx%d is empty", *width, *height);
+    return FALSE;
+  }
+
+  return TRUE;
 }
 
 static gboolean
@@ -687,13 +807,20 @@ gst_rfb_src_update_caps (GstRfbSrc * src)
   GST_VIDEO_INFO_FPS_D (&src->vinfo) = 1;
 
   caps = gst_video_info_to_caps (&src->vinfo);
-  if (caps == NULL)
+  if (caps == NULL) {
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
+        "negotiate-caps", "caps-allocation-failed",
+        "Could not allocate output caps");
     return FALSE;
+  }
 
   GST_DEBUG_OBJECT (src, "setting caps %" GST_PTR_FORMAT, caps);
 
   if (!gst_base_src_set_caps (GST_BASE_SRC (src), caps)) {
     gst_caps_unref (caps);
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
+        "negotiate-caps", "caps-negotiation-failed",
+        "Could not negotiate VNC output caps");
     return FALSE;
   }
   gst_caps_unref (caps);
@@ -732,16 +859,19 @@ gst_rfb_src_open (GstRfbSrc * src)
 
   g_return_val_if_fail (src->client == NULL, FALSE);
 
+  g_clear_pointer (&src->last_libvnc_error, g_free);
+
   if (src->host == NULL || *src->host == '\0') {
-    GST_ELEMENT_ERROR (src, RESOURCE, SETTINGS,
-        ("VNC host is empty"), (NULL));
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
+        "settings", "host-empty", "VNC host is empty");
     return FALSE;
   }
 
   client = rfbGetClient (8, 3, 4);
   if (client == NULL) {
-    GST_ELEMENT_ERROR (src, RESOURCE, FAILED,
-        ("Could not allocate libvncclient client"), (NULL));
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_FAILED,
+        "allocate-client", "allocation-failed",
+        "Could not allocate libvncclient client");
     return FALSE;
   }
 
@@ -792,18 +922,41 @@ gst_rfb_src_open (GstRfbSrc * src)
   GST_DEBUG_OBJECT (src, "connecting to VNC server %s:%d", src->host,
       src->port);
 
-  if (!ConnectToRFBServer (client, src->host, src->port)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, OPEN_READ,
-        ("Could not connect to VNC server %s:%d", src->host, src->port),
-        (NULL));
-    goto fail;
+  {
+    GstRfbSrc *previous_src = g_private_get (&gst_rfb_src_active_log_src);
+    rfbBool ret;
+
+    g_clear_pointer (&src->last_libvnc_error, g_free);
+    g_private_set (&gst_rfb_src_active_log_src, src);
+    ret = ConnectToRFBServer (client, src->host, src->port);
+    g_private_set (&gst_rfb_src_active_log_src, previous_src);
+
+    if (!ret) {
+      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_OPEN_READ,
+          "connect", "connection-failed",
+          "Could not connect to VNC server %s:%d", src->host, src->port);
+      goto fail;
+    }
+    g_clear_pointer (&src->last_libvnc_error, g_free);
   }
 
-  if (!InitialiseRFBConnection (client)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("Could not initialize VNC connection to %s:%d", src->host,
-            src->port), (NULL));
-    goto fail;
+  {
+    GstRfbSrc *previous_src = g_private_get (&gst_rfb_src_active_log_src);
+    rfbBool ret;
+
+    g_clear_pointer (&src->last_libvnc_error, g_free);
+    g_private_set (&gst_rfb_src_active_log_src, src);
+    ret = InitialiseRFBConnection (client);
+    g_private_set (&gst_rfb_src_active_log_src, previous_src);
+
+    if (!ret) {
+      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+          "initialise", gst_rfb_src_classify_initialise_failure (src),
+          "Could not initialize VNC connection to %s:%d", src->host,
+          src->port);
+      goto fail;
+    }
+    g_clear_pointer (&src->last_libvnc_error, g_free);
   }
 
   if (client->width <= 0 || client->height <= 0) {
@@ -812,24 +965,38 @@ gst_rfb_src_open (GstRfbSrc * src)
   }
 
   if (client->width <= 0 || client->height <= 0) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("VNC server reported invalid framebuffer size %dx%d",
-            client->width, client->height), (NULL));
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+        "initialise", "invalid-framebuffer-size",
+        "VNC server reported invalid framebuffer size %dx%d",
+        client->width, client->height);
     goto fail;
   }
 
   if (client->frameBuffer == NULL && !client->MallocFrameBuffer (client)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, NO_SPACE_LEFT,
-        ("Could not allocate %dx%d VNC framebuffer", client->width,
-            client->height), (NULL));
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
+        "allocate-framebuffer", "allocation-failed",
+        "Could not allocate %dx%d VNC framebuffer", client->width,
+        client->height);
     goto fail;
   }
 
-  if (!SetFormatAndEncodings (client)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
-        ("Could not send VNC pixel format/encodings to %s:%d", src->host,
-            src->port), (NULL));
-    goto fail;
+  {
+    GstRfbSrc *previous_src = g_private_get (&gst_rfb_src_active_log_src);
+    rfbBool ret;
+
+    g_clear_pointer (&src->last_libvnc_error, g_free);
+    g_private_set (&gst_rfb_src_active_log_src, src);
+    ret = SetFormatAndEncodings (client);
+    g_private_set (&gst_rfb_src_active_log_src, previous_src);
+
+    if (!ret) {
+      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_WRITE,
+          "set-format", "setup-failed",
+          "Could not send VNC pixel format/encodings to %s:%d", src->host,
+          src->port);
+      goto fail;
+    }
+    g_clear_pointer (&src->last_libvnc_error, g_free);
   }
 
   src->server_width = client->width;
@@ -873,6 +1040,7 @@ gst_rfb_src_close (GstRfbSrc * src)
   src->server_height = 0;
   src->button_mask = 0;
   g_clear_pointer (&src->active_encodings, g_free);
+  g_clear_pointer (&src->last_libvnc_error, g_free);
   gst_rfb_src_clear_cursor (src);
 }
 
@@ -880,6 +1048,8 @@ static gboolean
 gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
 {
   gboolean incremental;
+  GstRfbSrc *previous_src;
+  rfbBool ret;
 
   if (src->update_request_pending)
     return TRUE;
@@ -891,13 +1061,23 @@ gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
   incremental = src->frame_valid;
   src->frame_dirty = FALSE;
 
-  if (!SendFramebufferUpdateRequest (src->client, src->output_x, src->output_y,
-          src->output_width, src->output_height,
-          incremental ? GST_RFB_TRUE : GST_RFB_FALSE)) {
-    GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
-        ("Could not request VNC framebuffer update"), (NULL));
+  previous_src = g_private_get (&gst_rfb_src_active_log_src);
+  g_clear_pointer (&src->last_libvnc_error, g_free);
+  g_private_set (&gst_rfb_src_active_log_src, src);
+  ret = SendFramebufferUpdateRequest (src->client, src->output_x,
+      src->output_y, src->output_width, src->output_height,
+      incremental ? GST_RFB_TRUE : GST_RFB_FALSE);
+  g_private_set (&gst_rfb_src_active_log_src, previous_src);
+
+  if (!ret) {
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_WRITE,
+        "request-frame",
+        gst_rfb_src_classify_io_failure (src,
+            "framebuffer-update-request-failed"),
+        "Could not request VNC framebuffer update");
     return FALSE;
   }
+  g_clear_pointer (&src->last_libvnc_error, g_free);
 
   src->update_request_pending = TRUE;
   GST_LOG_OBJECT (src, "sent %s framebuffer update request x=%d y=%d %dx%d",
@@ -954,8 +1134,9 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
       deadline = now + src->frame_duration;
     }
     if (need_first_frame && now >= timeout_deadline) {
-      GST_ELEMENT_ERROR (src, RESOURCE, READ,
-          ("Timed out waiting for first VNC framebuffer update"), (NULL));
+      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+          "wait-frame", "first-frame-timeout",
+          "Timed out waiting for first VNC framebuffer update");
       return FALSE;
     }
 
@@ -989,25 +1170,46 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
      * TCP full-duplex makes concurrent read-wait and write safe.  The lock is
      * always re-acquired before we touch any src fields or call
      * HandleRFBServerMessage. */
-    g_rec_mutex_unlock (&src->client_lock);
-    ret = WaitForMessage (src->client, wait_usecs);
-    g_rec_mutex_lock (&src->client_lock);
+    {
+      GstRfbSrc *previous_src = g_private_get (&gst_rfb_src_active_log_src);
+
+      g_clear_pointer (&src->last_libvnc_error, g_free);
+      g_private_set (&gst_rfb_src_active_log_src, src);
+      g_rec_mutex_unlock (&src->client_lock);
+      ret = WaitForMessage (src->client, wait_usecs);
+      g_rec_mutex_lock (&src->client_lock);
+      g_private_set (&gst_rfb_src_active_log_src, previous_src);
+    }
 
     if (gst_rfb_src_is_unlocked (src))
       return FALSE;
 
     if (ret < 0) {
-      GST_ELEMENT_ERROR (src, RESOURCE, READ,
-          ("Error while waiting for VNC server message"), (NULL));
+      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+          "wait-message",
+          gst_rfb_src_classify_io_failure (src, "server-message-wait-failed"),
+          "Error while waiting for VNC server message");
       return FALSE;
     }
+    g_clear_pointer (&src->last_libvnc_error, g_free);
 
     if (ret > 0) {
-      if (!HandleRFBServerMessage (src->client)) {
-        GST_ELEMENT_ERROR (src, RESOURCE, READ,
-            ("Error while handling VNC server message"), (NULL));
+      GstRfbSrc *previous_src = g_private_get (&gst_rfb_src_active_log_src);
+      rfbBool handled;
+
+      g_clear_pointer (&src->last_libvnc_error, g_free);
+      g_private_set (&gst_rfb_src_active_log_src, src);
+      handled = HandleRFBServerMessage (src->client);
+      g_private_set (&gst_rfb_src_active_log_src, previous_src);
+
+      if (!handled) {
+        gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+            "handle-message",
+            gst_rfb_src_classify_io_failure (src, "server-message-failed"),
+            "Error while handling VNC server message");
         return FALSE;
       }
+      g_clear_pointer (&src->last_libvnc_error, g_free);
 
       if (src->geometry_changed) {
         src->geometry_changed = FALSE;
@@ -1128,11 +1330,18 @@ gst_rfb_src_copy_frame (GstRfbSrc * src, GstBuffer * buffer)
   gsize row_bytes;
   gint row;
 
-  if (src->client == NULL || src->client->frameBuffer == NULL)
+  if (src->client == NULL || src->client->frameBuffer == NULL) {
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+        "copy-frame", "no-framebuffer", "No VNC framebuffer available");
     return FALSE;
+  }
 
-  if (!gst_buffer_map (buffer, &map, GST_MAP_WRITE))
+  if (!gst_buffer_map (buffer, &map, GST_MAP_WRITE)) {
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_WRITE,
+        "copy-frame", "output-buffer-map-failed",
+        "Could not map output buffer for writing");
     return FALSE;
+  }
 
   source = src->client->frameBuffer;
   source_stride = (gsize) src->client->width * 4;
@@ -1674,6 +1883,7 @@ gst_rfb_src_finalize (GObject * object)
   g_free (src->version);
   g_free (src->encodings);
   g_free (src->active_encodings);
+  g_free (src->last_libvnc_error);
   g_rec_mutex_clear (&src->client_lock);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -1935,8 +2145,8 @@ gst_rfb_src_create (GstPushSrc * psrc, GstBuffer ** outbuf)
   gst_rfb_src_maybe_fallback_cursor (src);
 
   if (!src->frame_valid || src->client->frameBuffer == NULL) {
-    GST_ELEMENT_ERROR (src, RESOURCE, READ,
-        ("No VNC framebuffer available"), (NULL));
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
+        "create", "no-framebuffer", "No VNC framebuffer available");
     ret = GST_FLOW_ERROR;
     goto out;
   }
@@ -1944,14 +2154,15 @@ gst_rfb_src_create (GstPushSrc * psrc, GstBuffer ** outbuf)
   buffer = gst_buffer_new_allocate (NULL, GST_VIDEO_INFO_SIZE (&src->vinfo),
       NULL);
   if (buffer == NULL) {
+    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
+        "allocate-buffer", "output-buffer-allocation-failed",
+        "Could not allocate output buffer");
     ret = GST_FLOW_ERROR;
     goto out;
   }
 
   if (!gst_rfb_src_copy_frame (src, buffer)) {
     gst_buffer_unref (buffer);
-    GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
-        ("Could not copy VNC framebuffer into output buffer"), (NULL));
     ret = GST_FLOW_ERROR;
     goto out;
   }

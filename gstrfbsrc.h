@@ -69,6 +69,7 @@ struct _GstRfbSrc
   gchar *version;
   gchar *encodings;
   gchar *active_encodings;
+  gchar *last_libvnc_error;
 
   gint offset_x;
   gint offset_y;
