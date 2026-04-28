@@ -716,7 +716,6 @@ gst_rfb_src_sync_client_update_rect (GstRfbSrc * src)
   src->client->updateRect.y = src->output_y;
   src->client->updateRect.w = src->output_width;
   src->client->updateRect.h = src->output_height;
-  src->client->isUpdateRectManagedByLib = GST_RFB_FALSE;
 }
 
 static gboolean
