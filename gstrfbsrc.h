@@ -44,6 +44,14 @@ typedef struct _rfbClient rfbClient;
 typedef struct _GstRfbSrc GstRfbSrc;
 typedef struct _GstRfbSrcClass GstRfbSrcClass;
 
+typedef enum
+{
+  GST_RFB_SRC_CURSOR_MODE_AUTO,
+  GST_RFB_SRC_CURSOR_MODE_CLIENT,
+  GST_RFB_SRC_CURSOR_MODE_SERVER,
+  GST_RFB_SRC_CURSOR_MODE_NONE
+} GstRfbSrcCursorMode;
+
 struct _GstRfbSrcClass
 {
   GstPushSrcClass parent_class;
@@ -60,6 +68,7 @@ struct _GstRfbSrc
   gchar *password;
   gchar *version;
   gchar *encodings;
+  gchar *active_encodings;
 
   gint offset_x;
   gint offset_y;
@@ -76,6 +85,7 @@ struct _GstRfbSrc
   gboolean use_copyrect;
   gboolean shared;
   gboolean view_only;
+  GstRfbSrcCursorMode cursor_mode;
 
   gint max_framerate;
   guint frame_timeout_ms;
@@ -93,6 +103,22 @@ struct _GstRfbSrc
   gboolean have_caps;
 
   guint button_mask;
+
+  gboolean cursor_client_requested;
+  gboolean cursor_shape_valid;
+  gboolean cursor_position_valid;
+  gint cursor_auto_fallback_frames;
+  gint cursor_x;
+  gint cursor_y;
+  gint cursor_hot_x;
+  gint cursor_hot_y;
+  gint cursor_width;
+  gint cursor_height;
+  gint cursor_bpp;
+  guint8 *cursor_source;
+  guint8 *cursor_mask;
+  gsize cursor_source_size;
+  gsize cursor_mask_size;
 
   GstVideoInfo vinfo;
   GstClockTime frame_duration;

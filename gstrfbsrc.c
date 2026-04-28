@@ -61,6 +61,8 @@
 #define DEFAULT_PROP_FRAME_TIMEOUT_MS 1000
 #define DEFAULT_PROP_CONNECT_TIMEOUT  10
 #define DEFAULT_PROP_READ_TIMEOUT     10
+#define DEFAULT_PROP_CURSOR_MODE      GST_RFB_SRC_CURSOR_MODE_AUTO
+#define DEFAULT_CURSOR_FALLBACK_FRAMES 30
 
 #define GST_RFB_TRUE  ((rfbBool) -1)
 #define GST_RFB_FALSE ((rfbBool) 0)
@@ -83,6 +85,7 @@ enum
   PROP_ENCODINGS,
   PROP_SHARED,
   PROP_VIEWONLY,
+  PROP_CURSOR_MODE,
   PROP_MAX_FRAMERATE,
   PROP_FRAME_TIMEOUT_MS,
   PROP_CONNECT_TIMEOUT,
@@ -163,6 +166,29 @@ gst_rfb_src_install_libvnc_logging (void)
   }
 }
 
+static GType
+gst_rfb_src_cursor_mode_get_type (void)
+{
+  static gsize type_id = 0;
+
+  if (g_once_init_enter (&type_id)) {
+    static const GEnumValue values[] = {
+      {GST_RFB_SRC_CURSOR_MODE_AUTO, "Auto", "auto"},
+      {GST_RFB_SRC_CURSOR_MODE_CLIENT, "Client-side", "client"},
+      {GST_RFB_SRC_CURSOR_MODE_SERVER, "Server-side", "server"},
+      {GST_RFB_SRC_CURSOR_MODE_NONE, "None", "none"},
+      {0, NULL, NULL}
+    };
+    GType tmp = g_enum_register_static ("GstRfbSrcCursorMode", values);
+
+    g_once_init_leave (&type_id, tmp);
+  }
+
+  return type_id;
+}
+
+#define GST_TYPE_RFB_SRC_CURSOR_MODE (gst_rfb_src_cursor_mode_get_type ())
+
 static GstStaticPadTemplate gst_rfb_src_template =
     GST_STATIC_PAD_TEMPLATE ("src",
     GST_PAD_SRC,
@@ -231,6 +257,20 @@ gst_rfb_src_replace_string (gchar ** target, const gchar * value)
 {
   g_free (*target);
   *target = g_strdup (value);
+}
+
+static gpointer
+gst_rfb_src_memdup (gconstpointer data, gsize size)
+{
+  gpointer copy;
+
+  if (size == 0)
+    return NULL;
+
+  copy = g_malloc (size);
+  memcpy (copy, data, size);
+
+  return copy;
 }
 
 static gboolean
@@ -484,6 +524,101 @@ gst_rfb_src_finished_framebuffer_update (rfbClient * client)
   src->frame_valid = TRUE;
 }
 
+static void
+gst_rfb_src_clear_cursor (GstRfbSrc * src)
+{
+  g_clear_pointer (&src->cursor_source, g_free);
+  g_clear_pointer (&src->cursor_mask, g_free);
+  src->cursor_source_size = 0;
+  src->cursor_mask_size = 0;
+  src->cursor_shape_valid = FALSE;
+  src->cursor_position_valid = FALSE;
+  src->cursor_client_requested = FALSE;
+  src->cursor_auto_fallback_frames = 0;
+  src->cursor_x = 0;
+  src->cursor_y = 0;
+  src->cursor_hot_x = 0;
+  src->cursor_hot_y = 0;
+  src->cursor_width = 0;
+  src->cursor_height = 0;
+  src->cursor_bpp = 0;
+}
+
+static rfbBool
+gst_rfb_src_handle_cursor_pos (rfbClient * client, int x, int y)
+{
+  GstRfbSrc *src = gst_rfb_src_from_client (client);
+
+  if (src == NULL)
+    return GST_RFB_TRUE;
+
+  src->cursor_x = x;
+  src->cursor_y = y;
+  src->cursor_position_valid = TRUE;
+  src->frame_dirty = TRUE;
+
+  GST_LOG_OBJECT (src, "cursor position x=%d y=%d", x, y);
+
+  return GST_RFB_TRUE;
+}
+
+static void
+gst_rfb_src_got_cursor_shape (rfbClient * client, int xhot, int yhot,
+    int width, int height, int bytes_per_pixel)
+{
+  GstRfbSrc *src = gst_rfb_src_from_client (client);
+  guint64 source_size;
+  guint64 mask_size;
+
+  if (src == NULL)
+    return;
+
+  if (width <= 0 || height <= 0 || bytes_per_pixel <= 0 ||
+      bytes_per_pixel > 4) {
+    GST_WARNING_OBJECT (src, "ignoring invalid cursor shape %dx%d bpp=%d",
+        width, height, bytes_per_pixel);
+    src->cursor_shape_valid = FALSE;
+    return;
+  }
+
+  source_size = (guint64) width * height * bytes_per_pixel;
+  mask_size = ((guint64) width + 7) / 8 * height;
+  if (source_size > G_MAXSIZE || mask_size > G_MAXSIZE ||
+      client->rcSource == NULL) {
+    GST_WARNING_OBJECT (src, "ignoring cursor shape with invalid buffers");
+    src->cursor_shape_valid = FALSE;
+    return;
+  }
+
+  g_free (src->cursor_source);
+  g_free (src->cursor_mask);
+  src->cursor_source = gst_rfb_src_memdup (client->rcSource,
+      (gsize) source_size);
+  src->cursor_mask = client->rcMask ?
+      gst_rfb_src_memdup (client->rcMask, (gsize) mask_size) : NULL;
+  src->cursor_source_size = (gsize) source_size;
+  src->cursor_mask_size = client->rcMask ? (gsize) mask_size : 0;
+
+  if (src->cursor_source == NULL ||
+      (client->rcMask != NULL && src->cursor_mask == NULL)) {
+    GST_WARNING_OBJECT (src, "could not copy cursor shape");
+    src->cursor_shape_valid = FALSE;
+    return;
+  }
+
+  src->cursor_hot_x = xhot;
+  src->cursor_hot_y = yhot;
+  src->cursor_width = width;
+  src->cursor_height = height;
+  src->cursor_bpp = bytes_per_pixel;
+  src->cursor_shape_valid = TRUE;
+  src->cursor_auto_fallback_frames = 0;
+  src->frame_dirty = TRUE;
+
+  GST_DEBUG_OBJECT (src, "cursor shape %dx%d hot=%d,%d bpp=%d", width,
+      height, xhot, yhot, bytes_per_pixel);
+}
+
 static gboolean
 gst_rfb_src_compute_output_rect (GstRfbSrc * src, gint * x, gint * y,
     gint * width, gint * height)
@@ -569,11 +704,22 @@ gst_rfb_src_update_caps (GstRfbSrc * src)
   return TRUE;
 }
 
+static void
+gst_rfb_src_sync_client_update_rect (GstRfbSrc * src)
+{
+  if (src->client == NULL)
+    return;
+
+  src->client->updateRect.x = src->output_x;
+  src->client->updateRect.y = src->output_y;
+  src->client->updateRect.w = src->output_width;
+  src->client->updateRect.h = src->output_height;
+}
+
 static gboolean
 gst_rfb_src_open (GstRfbSrc * src)
 {
   rfbClient *client;
-  gchar *effective_encodings = NULL;
   const gchar *encodings;
 
   if (src->connected)
@@ -595,6 +741,9 @@ gst_rfb_src_open (GstRfbSrc * src)
   }
 
   src->client = client;
+  gst_rfb_src_clear_cursor (src);
+  src->cursor_client_requested =
+      src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_SERVER;
 
   rfbClientSetClientData (client, &gst_rfb_src_client_data_tag, src);
   client->MallocFrameBuffer = gst_rfb_src_malloc_framebuffer;
@@ -602,12 +751,15 @@ gst_rfb_src_open (GstRfbSrc * src)
   client->FinishedFrameBufferUpdate = gst_rfb_src_finished_framebuffer_update;
   client->GetPassword = gst_rfb_src_get_password;
   client->GetCredential = gst_rfb_src_get_credential;
+  client->HandleCursorPos = gst_rfb_src_handle_cursor_pos;
+  client->GotCursorShape = gst_rfb_src_got_cursor_shape;
 
   client->appData.shareDesktop = src->shared ? GST_RFB_TRUE : GST_RFB_FALSE;
   client->appData.viewOnly = src->view_only ? GST_RFB_TRUE : GST_RFB_FALSE;
   client->appData.forceTrueColour = GST_RFB_TRUE;
   client->appData.requestedDepth = 24;
-  client->appData.useRemoteCursor = GST_RFB_TRUE;
+  client->appData.useRemoteCursor =
+      src->cursor_client_requested ? GST_RFB_TRUE : GST_RFB_FALSE;
   client->connectTimeout = src->connect_timeout;
   client->readTimeout = src->read_timeout;
   client->canHandleNewFBSize = GST_RFB_TRUE;
@@ -624,11 +776,13 @@ gst_rfb_src_open (GstRfbSrc * src)
   client->format.blueShift = 0;
 
   encodings = src->encodings ? src->encodings : DEFAULT_PROP_ENCODINGS;
+  g_clear_pointer (&src->active_encodings, g_free);
   if (src->use_copyrect && strstr (encodings, "copyrect") == NULL) {
-    effective_encodings = g_strconcat ("copyrect ", encodings, NULL);
-    encodings = effective_encodings;
+    src->active_encodings = g_strconcat ("copyrect ", encodings, NULL);
+  } else {
+    src->active_encodings = g_strdup (encodings);
   }
-  client->appData.encodingsString = encodings;
+  client->appData.encodingsString = src->active_encodings;
 
   GST_DEBUG_OBJECT (src, "connecting to VNC server %s:%d", src->host,
       src->port);
@@ -637,7 +791,6 @@ gst_rfb_src_open (GstRfbSrc * src)
     GST_ELEMENT_ERROR (src, RESOURCE, OPEN_READ,
         ("Could not connect to VNC server %s:%d", src->host, src->port),
         (NULL));
-    g_free (effective_encodings);
     goto fail;
   }
 
@@ -645,7 +798,6 @@ gst_rfb_src_open (GstRfbSrc * src)
     GST_ELEMENT_ERROR (src, RESOURCE, READ,
         ("Could not initialize VNC connection to %s:%d", src->host,
             src->port), (NULL));
-    g_free (effective_encodings);
     goto fail;
   }
 
@@ -658,7 +810,6 @@ gst_rfb_src_open (GstRfbSrc * src)
     GST_ELEMENT_ERROR (src, RESOURCE, READ,
         ("VNC server reported invalid framebuffer size %dx%d",
             client->width, client->height), (NULL));
-    g_free (effective_encodings);
     goto fail;
   }
 
@@ -666,7 +817,6 @@ gst_rfb_src_open (GstRfbSrc * src)
     GST_ELEMENT_ERROR (src, RESOURCE, NO_SPACE_LEFT,
         ("Could not allocate %dx%d VNC framebuffer", client->width,
             client->height), (NULL));
-    g_free (effective_encodings);
     goto fail;
   }
 
@@ -674,11 +824,8 @@ gst_rfb_src_open (GstRfbSrc * src)
     GST_ELEMENT_ERROR (src, RESOURCE, WRITE,
         ("Could not send VNC pixel format/encodings to %s:%d", src->host,
             src->port), (NULL));
-    g_free (effective_encodings);
     goto fail;
   }
-
-  g_free (effective_encodings);
 
   src->server_width = client->width;
   src->server_height = client->height;
@@ -691,6 +838,8 @@ gst_rfb_src_open (GstRfbSrc * src)
 
   if (!gst_rfb_src_update_caps (src))
     goto fail;
+
+  gst_rfb_src_sync_client_update_rect (src);
 
   return TRUE;
 
@@ -717,6 +866,8 @@ gst_rfb_src_close (GstRfbSrc * src)
   src->server_width = 0;
   src->server_height = 0;
   src->button_mask = 0;
+  g_clear_pointer (&src->active_encodings, g_free);
+  gst_rfb_src_clear_cursor (src);
 }
 
 static gboolean
@@ -812,6 +963,118 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
 }
 
 static gboolean
+gst_rfb_src_cursor_is_usable (GstRfbSrc * src)
+{
+  return src->cursor_client_requested &&
+      src->cursor_shape_valid && src->cursor_position_valid &&
+      src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_NONE;
+}
+
+static void
+gst_rfb_src_maybe_fallback_cursor (GstRfbSrc * src)
+{
+  if (src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_AUTO ||
+      !src->cursor_client_requested ||
+      (src->cursor_shape_valid && src->cursor_position_valid))
+    return;
+
+  src->cursor_auto_fallback_frames++;
+  if (src->cursor_auto_fallback_frames < DEFAULT_CURSOR_FALLBACK_FRAMES)
+    return;
+
+  GST_INFO_OBJECT (src, "no usable remote cursor received; "
+      "falling back to server-drawn cursor");
+
+  gst_rfb_src_clear_cursor (src);
+  src->cursor_client_requested = FALSE;
+  src->client->appData.useRemoteCursor = GST_RFB_FALSE;
+
+  if (!SetFormatAndEncodings (src->client))
+    GST_WARNING_OBJECT (src,
+        "could not renegotiate server-drawn cursor fallback");
+}
+
+static gboolean
+gst_rfb_src_cursor_mask_is_opaque (GstRfbSrc * src, gint x, gint y)
+{
+  gsize mask_stride;
+  gsize mask_offset;
+
+  if (src->cursor_mask == NULL)
+    return TRUE;
+
+  mask_stride = ((gsize) src->cursor_width + 7) / 8;
+  mask_offset = (gsize) y * mask_stride + (gsize) x / 8;
+  if (mask_offset >= src->cursor_mask_size)
+    return FALSE;
+
+  return (src->cursor_mask[mask_offset] & (0x80 >> (x & 7))) != 0;
+}
+
+static void
+gst_rfb_src_draw_cursor (GstRfbSrc * src, GstMapInfo * map,
+    gsize output_stride)
+{
+  gint rel_x;
+  gint rel_y;
+  gint start_x;
+  gint start_y;
+  gint end_x;
+  gint end_y;
+  gint y;
+
+  if (!gst_rfb_src_cursor_is_usable (src))
+    return;
+
+  if (src->cursor_bpp != 4 && src->cursor_bpp != 3) {
+    GST_LOG_OBJECT (src, "skipping unsupported cursor bpp=%d",
+        src->cursor_bpp);
+    return;
+  }
+
+  rel_x = src->cursor_x - src->cursor_hot_x - src->output_x;
+  rel_y = src->cursor_y - src->cursor_hot_y - src->output_y;
+  start_x = MAX (0, -rel_x);
+  start_y = MAX (0, -rel_y);
+  end_x = MIN (src->cursor_width, src->output_width - rel_x);
+  end_y = MIN (src->cursor_height, src->output_height - rel_y);
+
+  if (start_x >= end_x || start_y >= end_y)
+    return;
+
+  for (y = start_y; y < end_y; y++) {
+    gint x;
+
+    for (x = start_x; x < end_x; x++) {
+      gsize source_offset;
+      gsize dest_offset;
+      const guint8 *source_pixel;
+      guint8 *dest_pixel;
+
+      if (!gst_rfb_src_cursor_mask_is_opaque (src, x, y))
+        continue;
+
+      source_offset = ((gsize) y * src->cursor_width + x) *
+          src->cursor_bpp;
+      dest_offset = (gsize) (rel_y + y) * output_stride +
+          (gsize) (rel_x + x) * 4;
+
+      if (source_offset + src->cursor_bpp > src->cursor_source_size ||
+          dest_offset + 4 > map->size)
+        continue;
+
+      source_pixel = src->cursor_source + source_offset;
+      dest_pixel = map->data + dest_offset;
+
+      dest_pixel[0] = source_pixel[0];
+      dest_pixel[1] = source_pixel[1];
+      dest_pixel[2] = source_pixel[2];
+      dest_pixel[3] = 0xff;
+    }
+  }
+}
+
+static gboolean
 gst_rfb_src_copy_frame (GstRfbSrc * src, GstBuffer * buffer)
 {
   GstMapInfo map;
@@ -840,6 +1103,8 @@ gst_rfb_src_copy_frame (GstRfbSrc * src, GstBuffer * buffer)
 
     memcpy (dst_row, src_row, row_bytes);
   }
+
+  gst_rfb_src_draw_cursor (src, &map, output_stride);
 
   gst_buffer_unmap (buffer, &map);
   return TRUE;
@@ -917,6 +1182,10 @@ gst_rfb_src_send_pointer_locked (GstRfbSrc * src, gint x, gint y,
     remote_y = CLAMP (remote_y, 0, src->client->height - 1);
 
   src->button_mask = button_mask;
+  src->cursor_x = remote_x;
+  src->cursor_y = remote_y;
+  src->cursor_position_valid = TRUE;
+  src->frame_dirty = TRUE;
 
   GST_LOG_OBJECT (src, "sending pointer event x=%d y=%d mask=%u",
       remote_x, remote_y, button_mask);
@@ -1186,6 +1455,12 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
           "Disable sending keyboard, pointer, and clipboard events", FALSE,
           ready_flags));
 
+  g_object_class_install_property (gobject_class, PROP_CURSOR_MODE,
+      g_param_spec_enum ("cursor-mode", "Cursor mode",
+          "How to include the remote mouse cursor in output frames",
+          GST_TYPE_RFB_SRC_CURSOR_MODE, DEFAULT_PROP_CURSOR_MODE,
+          ready_flags));
+
   g_object_class_install_property (gobject_class, PROP_MAX_FRAMERATE,
       g_param_spec_int ("max-framerate", "Maximum framerate",
           "Maximum output frames per second", 1, 240,
@@ -1322,6 +1597,7 @@ gst_rfb_src_init (GstRfbSrc * src)
   src->shared = TRUE;
   src->view_only = FALSE;
   src->use_copyrect = FALSE;
+  src->cursor_mode = DEFAULT_PROP_CURSOR_MODE;
   src->max_framerate = DEFAULT_PROP_MAX_FRAMERATE;
   src->frame_timeout_ms = DEFAULT_PROP_FRAME_TIMEOUT_MS;
   src->connect_timeout = DEFAULT_PROP_CONNECT_TIMEOUT;
@@ -1351,6 +1627,7 @@ gst_rfb_src_finalize (GObject * object)
   g_free (src->password);
   g_free (src->version);
   g_free (src->encodings);
+  g_free (src->active_encodings);
   g_rec_mutex_clear (&src->client_lock);
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
@@ -1422,6 +1699,10 @@ gst_rfb_src_set_property (GObject * object, guint prop_id,
     case PROP_VIEWONLY:
       if (!gst_rfb_src_is_running (src))
         src->view_only = g_value_get_boolean (value);
+      break;
+    case PROP_CURSOR_MODE:
+      if (!gst_rfb_src_is_running (src))
+        src->cursor_mode = g_value_get_enum (value);
       break;
     case PROP_MAX_FRAMERATE:
       if (!gst_rfb_src_is_running (src)) {
@@ -1501,6 +1782,9 @@ gst_rfb_src_get_property (GObject * object, guint prop_id,
       break;
     case PROP_VIEWONLY:
       g_value_set_boolean (value, src->view_only);
+      break;
+    case PROP_CURSOR_MODE:
+      g_value_set_enum (value, src->cursor_mode);
       break;
     case PROP_MAX_FRAMERATE:
       g_value_set_int (value, src->max_framerate);
@@ -1592,6 +1876,7 @@ gst_rfb_src_create (GstPushSrc * psrc, GstBuffer ** outbuf)
       ret = GST_FLOW_NOT_NEGOTIATED;
       goto out;
     }
+    gst_rfb_src_sync_client_update_rect (src);
   }
 
   if (!gst_rfb_src_send_framebuffer_update_request (src) ||
@@ -1599,6 +1884,8 @@ gst_rfb_src_create (GstPushSrc * psrc, GstBuffer ** outbuf)
     ret = gst_rfb_src_is_unlocked (src) ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
     goto out;
   }
+
+  gst_rfb_src_maybe_fallback_cursor (src);
 
   if (!src->frame_valid || src->client->frameBuffer == NULL) {
     GST_ELEMENT_ERROR (src, RESOURCE, READ,
