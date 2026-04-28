@@ -49,6 +49,7 @@
 #define TRUE (!FALSE)
 
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 
 #define DEFAULT_PROP_HOST             "127.0.0.1"
@@ -104,6 +105,63 @@ static gint gst_rfb_src_client_data_tag;
 
 GST_DEBUG_CATEGORY_STATIC (rfbsrc_debug);
 #define GST_CAT_DEFAULT rfbsrc_debug
+
+static gchar *
+gst_rfb_src_format_libvnc_log (const char *format, va_list args)
+{
+  gchar *message;
+
+  message = g_strdup_vprintf (format, args);
+  if (message)
+    g_strchomp (message);
+
+  return message;
+}
+
+static void
+gst_rfb_src_libvnc_log (const char *format, ...)
+{
+  va_list args;
+  gchar *message;
+
+  va_start (args, format);
+  message = gst_rfb_src_format_libvnc_log (format, args);
+  va_end (args);
+
+  if (message && *message)
+    GST_CAT_DEBUG (rfbsrc_debug, "%s", message);
+
+  g_free (message);
+}
+
+static void
+gst_rfb_src_libvnc_err (const char *format, ...)
+{
+  va_list args;
+  gchar *message;
+
+  va_start (args, format);
+  message = gst_rfb_src_format_libvnc_log (format, args);
+  va_end (args);
+
+  if (message && *message)
+    GST_CAT_WARNING (rfbsrc_debug, "%s", message);
+
+  g_free (message);
+}
+
+static void
+gst_rfb_src_install_libvnc_logging (void)
+{
+  static gsize initialized = 0;
+
+  if (g_once_init_enter (&initialized)) {
+    rfbClientLog = gst_rfb_src_libvnc_log;
+    rfbClientErr = gst_rfb_src_libvnc_err;
+    rfbEnableClientLogging = TRUE;
+    g_once_init_leave (&initialized, 1);
+  }
+}
 
 static GstStaticPadTemplate gst_rfb_src_template =
     GST_STATIC_PAD_TEMPLATE ("src",
@@ -1018,6 +1076,7 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
 
   GST_DEBUG_CATEGORY_INIT (rfbsrc_debug, "rfbsrc", 0,
       "LibVNCClient-backed RFB source");
+  gst_rfb_src_install_libvnc_logging ();
 
   gobject_class = (GObjectClass *) klass;
   gstbasesrc_class = (GstBaseSrcClass *) klass;
