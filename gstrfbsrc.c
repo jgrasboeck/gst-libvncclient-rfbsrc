@@ -1,5 +1,5 @@
 /* GStreamer
- * Copyright (C) <2026> Autonoma
+ * Copyright (C) <2026> Julian Grasböck <j.grasboeck@gmail.com>
  * Copyright (C) <2007> Thijs Vermeir <thijsvermeir@gmail.com>
  * Copyright (C) <2006> Andre Moreira Magalhaes <andre.magalhaes@indt.org.br>
  * Copyright (C) <2004> David A. Schleef <ds@schleef.org>

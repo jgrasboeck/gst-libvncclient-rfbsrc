@@ -1,29 +1,26 @@
-# Introduction
-
-This is a copy of gstrfbsrc.c from
-[gst-plugins-bad](https://gitlab.freedesktop.org/gstreamer/gst-plugins-bad),
-but using [libvncclient](https://libvnc.github.io/) instead of their
-custom rfbdecoder, which seems to result in better behavior with some
-servers.
+# About
+This is an adapted version of the gstreamer rfbsrc plugin using libvncclient for RFB protocol abstraction instead of a custom decoder as in the gstreamer plugin.  
+This not only leads to better performance, but also enables support of more encodings and implementation of user input path, which was already included with this adaption.
 
 # Building
+To build this plugin, ready to replace the original rfbsrc library, execute the following command on a machine with the target arch. _NOTE_: You may require to install other dependencies (gstreamer libs, compiler, ...).
 
-The supported way to build this is via the
-[Nix](https://nixos.org/nix) package manager, through the
-[nix-remarkable](https://github.com/peter-sa/nix-remarkable)
-expressions. To build just this project via `nix build` from this
-repo, download it into the `pkgs/` directory of `nix-remarkable`.
+``` bash
+mkdir -p ./build/
+gcc -c -fPIC ./gstrfbsrc.c \
+      -o ./build/gstrfbsrc.o \
+      -DVERSION=\"1.0.0\" -DPACKAGE=\"gst-libvncclient-rfbsrc\" \
+      -DGST_LICENSE=\"LGPL\" \
+      -DGST_PACKAGE_NAME=\"gst-libvncclient-rfbsrc\" \
+      -DGST_PACKAGE_ORIGIN=\"https://github.com/jgrasboeck/gst-libvncclient-rfbsrc\" \
+      $(pkg-config --cflags gstreamer-1.0 gstreamer-base-1.0 gstreamer-video-1.0) &&
+gcc -o ./build/libgstrfbsrc.o \
+      -shared /tmp/gst-libvncclient-rfbsrc/build/gstrfbsrc.o \
+      -Wl,--as-needed -Wl,--no-undefined -fPIC \
+      -Wl,--start-group -lgstbase-1.0 -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0 -lgstvideo-1.0 -lgio-2.0 -lvncclient \
+      -Wl,--end-group
+```
 
-For other systems, the commands needed to compile and link are
-relatively simple, and given in [derivation.nix](./derivation.nix).
-
-# Usage
-
-This module provides an `rfbsrc` GStreamer element. For example, if
-the produced `libgstrfbsrc.so` is in `result/lib`, a VNC server from
-localhost could be rotated right 90 degrees and connected to
-video-conferencing software expecting 1280x720 YUV420 video on a
-[v4l2loopback](https://github.com/umlaeute/v4l2loopback) device
-`/dev/video0` via the command:
-
-    GST_PLUGIN_PATH_1_0=result/lib gst-launch-1.0 rfbsrc host=127.0.0.1,port=5900 ! videoconvert ! videoflip video-direction=90r ! videoscale ! video/x-raw,format=I420,width=1280,height=720,pixel-aspect-ratio=1/1 ! queue ! v4l2sink device=/dev/video0
+# ATTENTION
+As this plugin is built against other libs (e.g. libvncclient) be carefull when building this application again on different operating systems since those might ship different versions
+of those libs in their package repos.
