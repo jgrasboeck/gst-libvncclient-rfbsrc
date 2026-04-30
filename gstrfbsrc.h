@@ -95,16 +95,22 @@ struct _GstRfbSrc
 
   rfbClient *client;
   GRecMutex client_lock;
+  GMutex pending_pointer_lock;
 
   gboolean connected;
   gint unlocked;
   gboolean frame_valid;
   gboolean frame_dirty;
+  gboolean cursor_dirty;
   gboolean geometry_changed;
   gboolean have_caps;
   gboolean update_request_pending;
 
   guint button_mask;
+  gboolean pending_pointer_valid;
+  gint pending_pointer_x;
+  gint pending_pointer_y;
+  guint pending_pointer_button_mask;
 
   gboolean cursor_client_requested;
   gboolean cursor_shape_valid;
@@ -121,6 +127,10 @@ struct _GstRfbSrc
   guint8 *cursor_mask;
   gsize cursor_source_size;
   gsize cursor_mask_size;
+
+  GHashTable *pressed_keys; /* code -> keysym (guint) for active send-dom-key presses */
+
+  GstBufferPool *pool;
 
   GstVideoInfo vinfo;
   GstClockTime frame_duration;
