@@ -1629,14 +1629,46 @@ gst_rfb_src_signal_send_dom_key (GstRfbSrc * src, const gchar * key,
   guint keysym;
   gboolean ret;
 
+  GST_DEBUG_OBJECT (src, "dom request keys=%s code=%s location=%d down=%s", key,
+      code, location, down ? "TRUE" : "FALSE");
+
   keysym = gst_rfb_src_dom_key_to_keysym (key, location);
+
+  g_rec_mutex_lock (&src->client_lock);
+
+  /* On keyup the browser reports the base character (e.g. "q") instead of the
+   * modified one (e.g. "@"), so use the keysym recorded at keydown time. */
+  if (!down && code != NULL && code[0] != '\0' && src->pressed_keys) {
+    gpointer stored = g_hash_table_lookup (src->pressed_keys, code);
+    if (stored) {
+      keysym = GPOINTER_TO_UINT (stored);
+    }
+  }
+
   if (keysym == 0) {
+    g_rec_mutex_unlock (&src->client_lock);
     GST_DEBUG_OBJECT (src, "no keysym for DOM key='%s' code='%s' location=%d",
         GST_STR_NULL (key), GST_STR_NULL (code), location);
     return FALSE;
   }
 
-  g_rec_mutex_lock (&src->client_lock);
+  /* Windows represents AltGr as LCtrl+RAlt. The browser forwards both, so the
+   * VNC server would see Ctrl held when the special character arrives (e.g.
+   * Ctrl+@ = NUL instead of @). Release any held Control keys before sending
+   * AltGraph down. */
+  if (down && keysym == XK_ISO_Level3_Shift && src->pressed_keys) {
+    static const gchar *ctrl_codes[] = { "ControlLeft", "ControlRight", NULL };
+    for (gint i = 0; ctrl_codes[i] != NULL; i++) {
+      gpointer stored = g_hash_table_lookup (src->pressed_keys, ctrl_codes[i]);
+      if (stored) {
+        GST_DEBUG_OBJECT (src, "suppressing Control ('%s') held alongside AltGraph",
+            ctrl_codes[i]);
+        gst_rfb_src_send_key_locked (src, GPOINTER_TO_UINT (stored), FALSE);
+        g_hash_table_remove (src->pressed_keys, ctrl_codes[i]);
+      }
+    }
+  }
+
   ret = gst_rfb_src_send_key_locked (src, keysym, down);
   if (ret && code != NULL && code[0] != '\0' && src->pressed_keys) {
     if (down)
@@ -1645,6 +1677,7 @@ gst_rfb_src_signal_send_dom_key (GstRfbSrc * src, const gchar * key,
     else
       g_hash_table_remove (src->pressed_keys, code);
   }
+  // TODO: Is this unlock needed?
   g_rec_mutex_unlock (&src->client_lock);
 
   return ret;
