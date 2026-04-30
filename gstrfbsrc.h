@@ -19,86 +19,86 @@
  * Boston, MA 02110-1301, USA.
  */
 
-#ifndef __GST_RFB_SRC_H__
-#define __GST_RFB_SRC_H__
+#ifndef GST_PLUGINS_BAD_GST_LIBRFB_GSTRFBSRC_H_
+#define GST_PLUGINS_BAD_GST_LIBRFB_GSTRFBSRC_H_
 
-#include <gst/gst.h>
 #include <gst/base/gstpushsrc.h>
+#include <gst/gst.h>
 #include <gst/video/video.h>
 
 G_BEGIN_DECLS
 
 typedef struct _rfbClient rfbClient;
 
-#define GST_TYPE_RFB_SRC \
-  (gst_rfb_src_get_type())
+#define GST_TYPE_RFB_SRC (gst_rfb_src_get_type())
 #define GST_RFB_SRC(obj) \
-  (G_TYPE_CHECK_INSTANCE_CAST((obj),GST_TYPE_RFB_SRC,GstRfbSrc))
+  (G_TYPE_CHECK_INSTANCE_CAST((obj), GST_TYPE_RFB_SRC, GstRfbSrc))
 #define GST_RFB_SRC_CLASS(klass) \
-  (G_TYPE_CHECK_CLASS_CAST((klass),GST_TYPE_RFB_SRC,GstRfbSrcClass))
+  (G_TYPE_CHECK_CLASS_CAST((klass), GST_TYPE_RFB_SRC, GstRfbSrcClass))
 #define GST_IS_RFB_SRC(obj) \
-  (G_TYPE_CHECK_INSTANCE_TYPE((obj),GST_TYPE_RFB_SRC))
+  (G_TYPE_CHECK_INSTANCE_TYPE((obj), GST_TYPE_RFB_SRC))
 #define GST_IS_RFB_SRC_CLASS(klass) \
-  (G_TYPE_CHECK_CLASS_TYPE((klass),GST_TYPE_RFB_SRC))
+  (G_TYPE_CHECK_CLASS_TYPE((klass), GST_TYPE_RFB_SRC))
 
 typedef struct _GstRfbSrc GstRfbSrc;
 typedef struct _GstRfbSrcClass GstRfbSrcClass;
 
-typedef enum
-{
+typedef enum {
   GST_RFB_SRC_CURSOR_MODE_AUTO,
   GST_RFB_SRC_CURSOR_MODE_CLIENT,
   GST_RFB_SRC_CURSOR_MODE_SERVER,
   GST_RFB_SRC_CURSOR_MODE_NONE
 } GstRfbSrcCursorMode;
 
-struct _GstRfbSrcClass
-{
+struct _GstRfbSrcClass {
   GstPushSrcClass parent_class;
 };
 
-struct _GstRfbSrc
-{
+struct _GstRfbSrc {
   GstPushSrc element;
 
-  GstUri *uri;
-  gchar *host;
+  /* --- Connection parameters (set before PLAYING, read-only while running) ---
+   */
+  GstUri* uri;
+  gchar* host;
   gint port;
-  gchar *username;
-  gchar *password;
-  gchar *version;
-  gchar *encodings;
-  gchar *active_encodings;
-  gchar *last_libvnc_error;
+  gchar* username;
+  gchar* password;
+  gchar* encodings;
+  gchar* active_encodings;  /* built from encodings + use_copyrect at connect
+                               time */
+  gchar* last_libvnc_error; /* last error string from libvncclient */
 
-  gint offset_x;
+  /* --- Capture geometry --- */
+  gint offset_x; /* top-left of capture rect in server coordinates */
   gint offset_y;
-  gint requested_width;
-  gint requested_height;
-  gint output_x;
-  gint output_y;
-  gint output_width;
+  gint requested_width;  /* 0 = use remaining server width */
+  gint requested_height; /* 0 = use remaining server height */
+  gint output_width;     /* actual clamped output dimensions */
   gint output_height;
-  gint server_width;
+  gint server_width; /* reported framebuffer size */
   gint server_height;
 
+  /* --- Options --- */
   gboolean incremental_update;
   gboolean use_copyrect;
   gboolean shared;
   gboolean view_only;
   GstRfbSrcCursorMode cursor_mode;
 
+  /* --- Timing --- */
   gint max_framerate;
   guint frame_timeout_ms;
   guint connect_timeout;
   guint read_timeout;
 
-  rfbClient *client;
+  /* --- VNC client (protected by client_lock) --- */
+  rfbClient* client;
   GRecMutex client_lock;
-  GMutex pending_pointer_lock;
 
+  /* --- Streaming state (protected by client_lock unless noted) --- */
   gboolean connected;
-  gint unlocked;
+  gint unlocked; /* atomic: non-zero when flushing */
   gboolean frame_valid;
   gboolean frame_dirty;
   gboolean cursor_dirty;
@@ -106,41 +106,44 @@ struct _GstRfbSrc
   gboolean have_caps;
   gboolean update_request_pending;
 
-  guint button_mask;
+  /* --- Pending pointer (protected by pending_pointer_lock) --- */
+  GMutex pending_pointer_lock;
   gboolean pending_pointer_valid;
   gint pending_pointer_x;
   gint pending_pointer_y;
   guint pending_pointer_button_mask;
 
+  /* --- Input state (protected by client_lock) --- */
+  guint button_mask;
+  GHashTable* pressed_keys; /* DOM code → keysym for currently pressed keys */
+
+  /* --- Cursor state (protected by client_lock) --- */
   gboolean cursor_client_requested;
   gboolean cursor_shape_valid;
   gboolean cursor_position_valid;
   gint cursor_auto_fallback_frames;
-  gint cursor_x;
+  gint cursor_x; /* absolute server coordinates */
   gint cursor_y;
   gint cursor_hot_x;
   gint cursor_hot_y;
   gint cursor_width;
   gint cursor_height;
   gint cursor_bpp;
-  guint8 *cursor_source;
-  guint8 *cursor_mask;
-  gsize cursor_source_size;
-  gsize cursor_mask_size;
+  guint8* cursor_source; /* pixel data; size = width * height * cursor_bpp */
+  guint8*
+      cursor_mask; /* 1 byte per pixel (0=transparent); size = width * height */
 
-  GHashTable *pressed_keys; /* code -> keysym (guint) for active send-dom-key presses */
-
-  GstBufferPool *pool;
-
+  /* --- Output --- */
+  GstBufferPool* pool;
   GstVideoInfo vinfo;
   GstClockTime frame_duration;
   GstClockTime last_frame_time;
   GstClockTime next_pts;
 };
 
-GType gst_rfb_src_get_type (void);
-GST_ELEMENT_REGISTER_DECLARE (rfbsrc);
+GType gst_rfb_src_get_type(void);
+GST_ELEMENT_REGISTER_DECLARE(rfbsrc);
 
 G_END_DECLS
 
-#endif
+#endif  // GST_PLUGINS_BAD_GST_LIBRFB_GSTRFBSRC_H_

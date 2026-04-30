@@ -26,6 +26,7 @@
 #endif
 
 #include "gstrfbsrc.h"
+#include "rfbsrc-keymap.h"
 
 #if HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
@@ -42,8 +43,8 @@
 #ifdef FALSE
 #undef FALSE
 #endif
-#include <rfb/rfbclient.h>
 #include <rfb/keysym.h>
+#include <rfb/rfbclient.h>
 #ifdef TRUE
 #undef TRUE
 #endif
@@ -53,24 +54,27 @@
 #define FALSE (0)
 #define TRUE (!FALSE)
 
-#include <stdlib.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define DEFAULT_PROP_HOST             "127.0.0.1"
-#define DEFAULT_PROP_PORT             5900
-#define DEFAULT_PROP_URI              "rfb://"DEFAULT_PROP_HOST":"G_STRINGIFY(DEFAULT_PROP_PORT)
-#define DEFAULT_PROP_VERSION          "auto"
-#define DEFAULT_PROP_ENCODINGS        "tight zrle hextile raw"
-#define DEFAULT_PROP_MAX_FRAMERATE    30
+/* =========================================================================
+ * Constants and property defaults
+ * ========================================================================= */
+
+#define DEFAULT_PROP_HOST "127.0.0.1"
+#define DEFAULT_PROP_PORT 5900
+#define DEFAULT_PROP_URI "rfb://"DEFAULT_PROP_HOST":"G_STRINGIFY(DEFAULT_PROP_PORT)
+#define DEFAULT_PROP_ENCODINGS "tight zrle hextile raw"
+#define DEFAULT_PROP_MAX_FRAMERATE 30
 #define DEFAULT_PROP_FRAME_TIMEOUT_MS 5000
-#define DEFAULT_PROP_CONNECT_TIMEOUT  10
-#define DEFAULT_PROP_READ_TIMEOUT     10
-#define DEFAULT_PROP_CURSOR_MODE      GST_RFB_SRC_CURSOR_MODE_AUTO
+#define DEFAULT_PROP_CONNECT_TIMEOUT 10
+#define DEFAULT_PROP_READ_TIMEOUT 10
+#define DEFAULT_PROP_CURSOR_MODE GST_RFB_SRC_CURSOR_MODE_AUTO
 #define DEFAULT_CURSOR_FALLBACK_FRAMES 30
 
-#define GST_RFB_TRUE  ((rfbBool) -1)
-#define GST_RFB_FALSE ((rfbBool) 0)
+#define GST_RFB_TRUE ((rfbBool) - 1)
+#define GST_RFB_FALSE ((rfbBool)0)
 
 #if defined(IPPROTO_TCP) && defined(TCP_NODELAY)
 #define GST_RFB_SRC_HAVE_TCP_NODELAY 1
@@ -79,14 +83,16 @@
 #define GST_RFB_SRC_HAVE_TCP_NODELAY 0
 #endif
 
-enum
-{
+/* =========================================================================
+ * GObject property and signal enum values
+ * ========================================================================= */
+
+enum {
   PROP_0,
   PROP_URI,
   PROP_HOST,
   PROP_PORT,
   PROP_USERNAME,
-  PROP_VERSION,
   PROP_PASSWORD,
   PROP_OFFSET_X,
   PROP_OFFSET_Y,
@@ -104,8 +110,7 @@ enum
   PROP_READ_TIMEOUT
 };
 
-enum
-{
+enum {
   SIGNAL_SEND_KEY,
   SIGNAL_SEND_DOM_KEY,
   SIGNAL_SEND_POINTER,
@@ -116,611 +121,402 @@ enum
   SIGNAL_LAST
 };
 
+/* =========================================================================
+ * Module-level statics
+ * ========================================================================= */
+
 static guint gst_rfb_src_signals[SIGNAL_LAST];
 static gint gst_rfb_src_client_data_tag;
-static GPrivate gst_rfb_src_active_log_src = G_PRIVATE_INIT (NULL);
+static GPrivate gst_rfb_src_active_log_src = G_PRIVATE_INIT(NULL);
 
-GST_DEBUG_CATEGORY_STATIC (rfbsrc_debug);
+GST_DEBUG_CATEGORY_STATIC(rfbsrc_debug);
 #define GST_CAT_DEFAULT rfbsrc_debug
 
-static void
-gst_rfb_src_remember_libvnc_error (GstRfbSrc * src, const gchar * message)
+/* =========================================================================
+ * Forward declarations
+ * ========================================================================= */
+
+static gboolean gst_rfb_src_start(GstBaseSrc* bsrc);
+static gboolean gst_rfb_src_stop(GstBaseSrc* bsrc);
+static gboolean gst_rfb_src_negotiate(GstBaseSrc* bsrc);
+static gboolean gst_rfb_src_unlock(GstBaseSrc* bsrc);
+static gboolean gst_rfb_src_unlock_stop(GstBaseSrc* bsrc);
+static GstFlowReturn gst_rfb_src_create(GstPushSrc* psrc, GstBuffer** outbuf);
+
+static void gst_rfb_src_uri_handler_init(gpointer g_iface, gpointer iface_data);
+static gboolean gst_rfb_src_uri_set_uri(GstURIHandler* handler,
+                                        const gchar* uri, GError** error);
+
+static gboolean gst_rfb_src_signal_send_key(GstRfbSrc* src, guint keysym,
+                                            gboolean down);
+static gboolean gst_rfb_src_signal_send_dom_key(GstRfbSrc* src,
+                                                const gchar* key,
+                                                const gchar* code,
+                                                gint location, gboolean down);
+static gboolean gst_rfb_src_signal_send_pointer(GstRfbSrc* src, gint x, gint y,
+                                                guint button_mask);
+static gboolean gst_rfb_src_signal_send_mouse_button(GstRfbSrc* src,
+                                                     gint button, gboolean down,
+                                                     gint x, gint y);
+static gboolean gst_rfb_src_signal_send_text(GstRfbSrc* src, const gchar* text);
+static gboolean gst_rfb_src_signal_send_clipboard(GstRfbSrc* src,
+                                                  const gchar* text);
+static gboolean gst_rfb_src_signal_reset_input(GstRfbSrc* src);
+
+static void gst_rfb_src_flush_pending_pointer_locked(GstRfbSrc* src);
+static void gst_rfb_src_clear_pending_pointer(GstRfbSrc* src);
+
+static void gst_rfb_src_finalize(GObject* object);
+static void gst_rfb_src_set_property(GObject* object, guint prop_id,
+                                     const GValue* value, GParamSpec* pspec);
+static void gst_rfb_src_get_property(GObject* object, guint prop_id,
+                                     GValue* value, GParamSpec* pspec);
+
+/* =========================================================================
+ * GObject type registration
+ * ========================================================================= */
+
+#define gst_rfb_src_parent_class parent_class
+G_DEFINE_TYPE_WITH_CODE(GstRfbSrc, gst_rfb_src, GST_TYPE_PUSH_SRC,
+                        G_IMPLEMENT_INTERFACE(GST_TYPE_URI_HANDLER,
+                                              gst_rfb_src_uri_handler_init));
+GST_ELEMENT_REGISTER_DEFINE(rfbsrc, "rfbsrc", GST_RANK_NONE, GST_TYPE_RFB_SRC);
+
+/* =========================================================================
+ * Utilities: compat shims and string helpers
+ * ========================================================================= */
+
+/* g_memdup2 was added in GLib 2.68; the project minimum is 2.64 */
+#if !GLIB_CHECK_VERSION(2, 68, 0)
+static gpointer g_memdup2(gconstpointer data, gsize size)
 {
-  gchar *lower;
+  gpointer copy;
 
-  if (src == NULL || message == NULL || *message == '\0')
+  if (size == 0) {
+    return NULL;
+  }
+
+  copy = g_malloc(size);
+  memcpy(copy, data, size);
+  return copy;
+}
+#endif
+
+static void gst_rfb_src_replace_string(gchar** target, const gchar* value)
+{
+  g_free(*target);
+  *target = g_strdup(value);
+}
+
+/* =========================================================================
+ * Utilities: error classification and posting
+ * ========================================================================= */
+
+static void gst_rfb_src_remember_libvnc_error(GstRfbSrc* src,
+                                              const gchar* message)
+{
+  gchar* lower;
+
+  if (src == NULL || message == NULL || *message == '\0') {
     return;
+  }
 
-  lower = g_ascii_strdown (message, -1);
+  lower = g_ascii_strdown(message, -1);
 
   if (src->last_libvnc_error) {
-    gchar *combined = g_strconcat (src->last_libvnc_error, "; ", lower, NULL);
+    gchar* combined = g_strconcat(src->last_libvnc_error, "; ", lower, NULL);
 
-    g_free (src->last_libvnc_error);
-    g_free (lower);
+    g_free(src->last_libvnc_error);
+    g_free(lower);
     src->last_libvnc_error = combined;
-  } else {
+  }
+  else {
     src->last_libvnc_error = lower;
   }
 }
 
 /* needle must be lowercase since last_libvnc_error is stored lowercased */
-static gboolean
-gst_rfb_src_libvnc_message_contains (GstRfbSrc * src, const gchar * needle)
+static gboolean gst_rfb_src_libvnc_message_contains(GstRfbSrc* src,
+                                                    const gchar* needle)
 {
-  if (src->last_libvnc_error == NULL || needle == NULL)
+  if (src->last_libvnc_error == NULL || needle == NULL) {
     return FALSE;
+  }
 
-  return strstr (src->last_libvnc_error, needle) != NULL;
+  return strstr(src->last_libvnc_error, needle) != NULL;
 }
 
-static const gchar *
-gst_rfb_src_classify_initialise_failure (GstRfbSrc * src)
+static const gchar* gst_rfb_src_classify_initialise_failure(GstRfbSrc* src)
 {
-  if (gst_rfb_src_libvnc_message_contains (src, "auth") ||
-      gst_rfb_src_libvnc_message_contains (src, "password") ||
-      gst_rfb_src_libvnc_message_contains (src, "credential"))
+  if (gst_rfb_src_libvnc_message_contains(src, "auth") ||
+      gst_rfb_src_libvnc_message_contains(src, "password") ||
+      gst_rfb_src_libvnc_message_contains(src, "credential")) {
     return "authentication-failed";
+  }
 
-  if (gst_rfb_src_libvnc_message_contains (src, "security"))
+  if (gst_rfb_src_libvnc_message_contains(src, "security")) {
     return "security-negotiation-failed";
+  }
 
   return "protocol-error";
 }
 
-static const gchar *
-gst_rfb_src_classify_io_failure (GstRfbSrc * src,
-    const gchar * default_reason)
+static const gchar* gst_rfb_src_classify_io_failure(GstRfbSrc* src,
+                                                    const gchar* default_reason)
 {
-  if (gst_rfb_src_libvnc_message_contains (src, "closed") ||
-      gst_rfb_src_libvnc_message_contains (src, "connection reset") ||
-      gst_rfb_src_libvnc_message_contains (src, "broken pipe") ||
-      gst_rfb_src_libvnc_message_contains (src, "eof"))
+  if (gst_rfb_src_libvnc_message_contains(src, "closed") ||
+      gst_rfb_src_libvnc_message_contains(src, "connection reset") ||
+      gst_rfb_src_libvnc_message_contains(src, "broken pipe") ||
+      gst_rfb_src_libvnc_message_contains(src, "eof")) {
     return "connection-lost";
+  }
 
-  if (gst_rfb_src_libvnc_message_contains (src, "timed out") ||
-      gst_rfb_src_libvnc_message_contains (src, "timeout"))
+  if (gst_rfb_src_libvnc_message_contains(src, "timed out") ||
+      gst_rfb_src_libvnc_message_contains(src, "timeout")) {
     return "timeout";
+  }
 
   return default_reason;
 }
 
-static void
-gst_rfb_src_post_resource_error (GstRfbSrc * src, GstResourceError code,
-    const gchar * stage, const gchar * reason, const gchar * format, ...)
+static void gst_rfb_src_post_resource_error(GstRfbSrc* src,
+                                            GstResourceError code,
+                                            const gchar* stage,
+                                            const gchar* reason,
+                                            const gchar* format, ...)
 {
   va_list args;
-  gchar *text;
-  gchar *debug;
-  GstStructure *details;
-  const gchar *libvnc_error;
+  gchar* text;
+  gchar* debug;
+  GstStructure* details;
+  const gchar* libvnc_error;
 
-  va_start (args, format);
-  text = g_strdup_vprintf (format, args);
-  va_end (args);
+  va_start(args, format);
+  text = g_strdup_vprintf(format, args);
+  va_end(args);
 
   libvnc_error = src->last_libvnc_error;
   if (libvnc_error && *libvnc_error) {
-    debug = g_strdup_printf ("stage=%s reason=%s libvnc-error=%s",
-        stage, reason, libvnc_error);
-  } else {
-    debug = g_strdup_printf ("stage=%s reason=%s", stage, reason);
+    debug = g_strdup_printf("stage=%s reason=%s libvnc-error=%s", stage, reason,
+                            libvnc_error);
+  }
+  else {
+    debug = g_strdup_printf("stage=%s reason=%s", stage, reason);
   }
 
-  details = gst_structure_new ("rfbsrc-error",
-      "reason", G_TYPE_STRING, reason,
-      "stage", G_TYPE_STRING, stage,
-      "host", G_TYPE_STRING, src->host ? src->host : "",
-      "port", G_TYPE_INT, src->port, NULL);
+  details = gst_structure_new("rfbsrc-error", "reason", G_TYPE_STRING, reason,
+                              "stage", G_TYPE_STRING, stage, "host",
+                              G_TYPE_STRING, src->host ? src->host : "", "port",
+                              G_TYPE_INT, src->port, NULL);
   if (libvnc_error && *libvnc_error) {
-    gst_structure_set (details,
-        "libvnc-error", G_TYPE_STRING, libvnc_error, NULL);
+    gst_structure_set(details, "libvnc-error", G_TYPE_STRING, libvnc_error,
+                      NULL);
   }
 
-  if (text)
-    GST_WARNING_OBJECT (src, "error: %s", text);
-  if (debug)
-    GST_WARNING_OBJECT (src, "error: %s", debug);
+  if (text) {
+    GST_WARNING_OBJECT(src, "error: %s", text);
+  }
+  if (debug) {
+    GST_WARNING_OBJECT(src, "error: %s", debug);
+  }
 
-  gst_element_message_full_with_details (GST_ELEMENT_CAST (src),
-      GST_MESSAGE_ERROR, GST_RESOURCE_ERROR, code, text, debug, __FILE__,
-      GST_FUNCTION, __LINE__, details);
+  gst_element_message_full_with_details(
+      GST_ELEMENT_CAST(src), GST_MESSAGE_ERROR, GST_RESOURCE_ERROR, code, text,
+      debug, __FILE__, GST_FUNCTION, __LINE__, details);
 }
 
-static gchar *
-gst_rfb_src_format_libvnc_log (const char *format, va_list args)
+/* =========================================================================
+ * LibVNC logging and log-context
+ * ========================================================================= */
+
+static gchar* gst_rfb_src_format_libvnc_log(const char* format, va_list args)
 {
-  gchar *message;
+  gchar* message = g_strdup_vprintf(format, args);
 
-  message = g_strdup_vprintf (format, args);
-  if (message)
-    g_strchomp (message);
-
+  if (message) {
+    g_strchomp(message);
+  }
   return message;
 }
 
-static void
-gst_rfb_src_libvnc_log (const char *format, ...)
+static void gst_rfb_src_libvnc_log(const char* format, ...)
 {
   va_list args;
-  gchar *message;
+  gchar* message;
 
-  va_start (args, format);
-  message = gst_rfb_src_format_libvnc_log (format, args);
-  va_end (args);
-
-  if (message && *message)
-    GST_CAT_DEBUG (rfbsrc_debug, "%s", message);
-
-  g_free (message);
-}
-
-static void
-gst_rfb_src_libvnc_err (const char *format, ...)
-{
-  va_list args;
-  gchar *message;
-  GstRfbSrc *src;
-
-  va_start (args, format);
-  message = gst_rfb_src_format_libvnc_log (format, args);
-  va_end (args);
+  va_start(args, format);
+  message = gst_rfb_src_format_libvnc_log(format, args);
+  va_end(args);
 
   if (message && *message) {
-    src = g_private_get (&gst_rfb_src_active_log_src);
-    gst_rfb_src_remember_libvnc_error (src, message);
-    GST_CAT_WARNING (rfbsrc_debug, "%s", message);
+    GST_CAT_DEBUG(rfbsrc_debug, "%s", message);
   }
 
-  g_free (message);
+  g_free(message);
 }
 
-static void
-gst_rfb_src_install_libvnc_logging (void)
+static void gst_rfb_src_libvnc_err(const char* format, ...)
+{
+  va_list args;
+  gchar* message;
+  GstRfbSrc* src;
+
+  va_start(args, format);
+  message = gst_rfb_src_format_libvnc_log(format, args);
+  va_end(args);
+
+  if (message && *message) {
+    src = g_private_get(&gst_rfb_src_active_log_src);
+    gst_rfb_src_remember_libvnc_error(src, message);
+    GST_CAT_WARNING(rfbsrc_debug, "%s", message);
+  }
+
+  g_free(message);
+}
+
+static void gst_rfb_src_install_libvnc_logging(void)
 {
   static gsize initialized = 0;
 
-  if (g_once_init_enter (&initialized)) {
+  if (g_once_init_enter(&initialized)) {
     rfbClientLog = gst_rfb_src_libvnc_log;
     rfbClientErr = gst_rfb_src_libvnc_err;
     rfbEnableClientLogging = TRUE;
-    g_once_init_leave (&initialized, 1);
+    g_once_init_leave(&initialized, 1);
   }
 }
 
-static GType
-gst_rfb_src_cursor_mode_get_type (void)
+/* Sets this thread's active log source to src (for error capture) and clears
+ * any previously accumulated error string.  Returns the previous source so the
+ * caller can restore it with gst_rfb_src_log_ctx_leave. */
+static GstRfbSrc* gst_rfb_src_log_ctx_enter(GstRfbSrc* src)
 {
-  static gsize type_id = 0;
+  GstRfbSrc* previous = g_private_get(&gst_rfb_src_active_log_src);
 
-  if (g_once_init_enter (&type_id)) {
-    static const GEnumValue values[] = {
-      {GST_RFB_SRC_CURSOR_MODE_AUTO, "Auto", "auto"},
-      {GST_RFB_SRC_CURSOR_MODE_CLIENT, "Client-side", "client"},
-      {GST_RFB_SRC_CURSOR_MODE_SERVER, "Server-side", "server"},
-      {GST_RFB_SRC_CURSOR_MODE_NONE, "None", "none"},
-      {0, NULL, NULL}
-    };
-    GType tmp = g_enum_register_static ("GstRfbSrcCursorMode", values);
-
-    g_once_init_leave (&type_id, tmp);
-  }
-
-  return type_id;
-}
-
-#define GST_TYPE_RFB_SRC_CURSOR_MODE (gst_rfb_src_cursor_mode_get_type ())
-
-static GstStaticPadTemplate gst_rfb_src_template =
-    GST_STATIC_PAD_TEMPLATE ("src",
-    GST_PAD_SRC,
-    GST_PAD_ALWAYS,
-    GST_STATIC_CAPS (GST_VIDEO_CAPS_MAKE ("BGRx")));
-
-static void gst_rfb_src_finalize (GObject * object);
-static void gst_rfb_src_set_property (GObject * object, guint prop_id,
-    const GValue * value, GParamSpec * pspec);
-static void gst_rfb_src_get_property (GObject * object, guint prop_id,
-    GValue * value, GParamSpec * pspec);
-
-static gboolean gst_rfb_src_start (GstBaseSrc * bsrc);
-static gboolean gst_rfb_src_stop (GstBaseSrc * bsrc);
-static gboolean gst_rfb_src_negotiate (GstBaseSrc * bsrc);
-static gboolean gst_rfb_src_unlock (GstBaseSrc * bsrc);
-static gboolean gst_rfb_src_unlock_stop (GstBaseSrc * bsrc);
-static GstFlowReturn gst_rfb_src_create (GstPushSrc * psrc,
-    GstBuffer ** outbuf);
-
-static void gst_rfb_src_uri_handler_init (gpointer g_iface,
-    gpointer iface_data);
-static gboolean
-gst_rfb_src_uri_set_uri (GstURIHandler * handler, const gchar * uri,
-    GError ** error);
-
-static gboolean gst_rfb_src_signal_send_key (GstRfbSrc * src, guint keysym,
-    gboolean down);
-static gboolean gst_rfb_src_signal_send_dom_key (GstRfbSrc * src,
-    const gchar * key, const gchar * code, gint location, gboolean down);
-static gboolean gst_rfb_src_signal_reset_input (GstRfbSrc * src);
-static gboolean gst_rfb_src_signal_send_pointer (GstRfbSrc * src, gint x,
-    gint y, guint button_mask);
-static gboolean gst_rfb_src_signal_send_mouse_button (GstRfbSrc * src,
-    gint button, gboolean down, gint x, gint y);
-static gboolean gst_rfb_src_signal_send_text (GstRfbSrc * src,
-    const gchar * text);
-static gboolean gst_rfb_src_signal_send_clipboard (GstRfbSrc * src,
-    const gchar * text);
-static void gst_rfb_src_flush_pending_pointer_locked (GstRfbSrc * src);
-
-static void
-gst_rfb_src_store_pending_pointer (GstRfbSrc * src, gint x, gint y,
-    guint button_mask)
-{
-  g_mutex_lock (&src->pending_pointer_lock);
-  src->pending_pointer_x = x;
-  src->pending_pointer_y = y;
-  src->pending_pointer_button_mask = button_mask;
-  src->pending_pointer_valid = TRUE;
-  g_mutex_unlock (&src->pending_pointer_lock);
-}
-
-static gboolean
-gst_rfb_src_take_pending_pointer (GstRfbSrc * src, gint * x, gint * y,
-    guint * button_mask)
-{
-  gboolean ret;
-
-  g_mutex_lock (&src->pending_pointer_lock);
-  ret = src->pending_pointer_valid;
-  if (ret) {
-    *x = src->pending_pointer_x;
-    *y = src->pending_pointer_y;
-    *button_mask = src->pending_pointer_button_mask;
-    src->pending_pointer_valid = FALSE;
-  }
-  g_mutex_unlock (&src->pending_pointer_lock);
-
-  return ret;
-}
-
-static void
-gst_rfb_src_clear_pending_pointer (GstRfbSrc * src)
-{
-  g_mutex_lock (&src->pending_pointer_lock);
-  src->pending_pointer_valid = FALSE;
-  g_mutex_unlock (&src->pending_pointer_lock);
-}
-
-#define gst_rfb_src_parent_class parent_class
-G_DEFINE_TYPE_WITH_CODE (GstRfbSrc, gst_rfb_src, GST_TYPE_PUSH_SRC,
-    G_IMPLEMENT_INTERFACE (GST_TYPE_URI_HANDLER, gst_rfb_src_uri_handler_init));
-GST_ELEMENT_REGISTER_DEFINE (rfbsrc, "rfbsrc", GST_RANK_NONE, GST_TYPE_RFB_SRC);
-
-static GstRfbSrc *
-gst_rfb_src_log_ctx_enter (GstRfbSrc * src)
-{
-  GstRfbSrc *previous = g_private_get (&gst_rfb_src_active_log_src);
-
-  g_clear_pointer (&src->last_libvnc_error, g_free);
-  g_private_set (&gst_rfb_src_active_log_src, src);
+  g_clear_pointer(&src->last_libvnc_error, g_free);
+  g_private_set(&gst_rfb_src_active_log_src, src);
   return previous;
 }
 
-static void
-gst_rfb_src_log_ctx_leave (GstRfbSrc * previous)
+static void gst_rfb_src_log_ctx_leave(GstRfbSrc* previous)
 {
-  g_private_set (&gst_rfb_src_active_log_src, previous);
+  g_private_set(&gst_rfb_src_active_log_src, previous);
 }
 
-static void
-gst_rfb_src_configure_socket_low_latency (GstRfbSrc * src)
+/* =========================================================================
+ * State predicates and property-change guards
+ * ========================================================================= */
+
+static gboolean gst_rfb_src_is_running(GstRfbSrc* src)
 {
-#if GST_RFB_SRC_HAVE_TCP_NODELAY
-  int enabled = 1;
-
-  if (src->client == NULL || src->client->sock == RFB_INVALID_SOCKET)
-    return;
-
-  if (setsockopt (src->client->sock, IPPROTO_TCP, TCP_NODELAY,
-          (const void *) &enabled, sizeof (enabled)) != 0) {
-    GST_WARNING_OBJECT (src, "could not enable TCP_NODELAY on VNC socket");
-  } else {
-    GST_DEBUG_OBJECT (src, "enabled TCP_NODELAY on VNC socket");
-  }
-#else
-  (void) src;
-#endif
+  return GST_STATE(src) >= GST_STATE_PAUSED;
 }
 
-static gboolean
-gst_rfb_src_is_running (GstRfbSrc * src)
+static gboolean gst_rfb_src_is_unlocked(GstRfbSrc* src)
 {
-  return GST_STATE (src) >= GST_STATE_PAUSED;
+  return g_atomic_int_get(&src->unlocked) != 0;
 }
 
-static gboolean
-gst_rfb_src_is_unlocked (GstRfbSrc * src)
+static void gst_rfb_src_set_unlocked(GstRfbSrc* src, gboolean unlocked)
 {
-  return g_atomic_int_get (&src->unlocked) != 0;
+  g_atomic_int_set(&src->unlocked, unlocked ? 1 : 0);
 }
 
-static void
-gst_rfb_src_set_unlocked (GstRfbSrc * src, gboolean unlocked)
+static gboolean gst_rfb_src_check_ready(GstRfbSrc* src,
+                                        const gchar* property_name)
 {
-  g_atomic_int_set (&src->unlocked, unlocked ? 1 : 0);
-}
-
-static void
-gst_rfb_src_replace_string (gchar ** target, const gchar * value)
-{
-  g_free (*target);
-  *target = g_strdup (value);
-}
-
-/* g_memdup2 was added in GLib 2.68; the project minimum is 2.64 */
-#if !GLIB_CHECK_VERSION(2, 68, 0)
-static gpointer
-g_memdup2 (gconstpointer data, gsize size)
-{
-  gpointer copy;
-
-  if (size == 0)
-    return NULL;
-
-  copy = g_malloc (size);
-  memcpy (copy, data, size);
-
-  return copy;
-}
-#endif
-
-static gboolean
-gst_rfb_src_check_ready (GstRfbSrc * src, const gchar * property_name)
-{
-  if (gst_rfb_src_is_running (src)) {
-    GST_WARNING_OBJECT (src, "Can only change %s in NULL or READY state",
-        property_name);
+  if (gst_rfb_src_is_running(src)) {
+    GST_WARNING_OBJECT(src, "Can only change %s in NULL or READY state",
+                       property_name);
     return FALSE;
   }
   return TRUE;
 }
 
-static gboolean
-gst_rfb_src_set_ready_string (GstRfbSrc * src, gchar ** target,
-    const gchar * value, const gchar * property_name)
+static gboolean gst_rfb_src_set_ready_string(GstRfbSrc* src, gchar** target,
+                                             const gchar* value,
+                                             const gchar* property_name)
 {
-  if (!gst_rfb_src_check_ready (src, property_name))
+  if (!gst_rfb_src_check_ready(src, property_name)) {
     return FALSE;
+  }
 
-  gst_rfb_src_replace_string (target, value);
+  gst_rfb_src_replace_string(target, value);
   return TRUE;
 }
 
-static guint
-gst_rfb_src_unicode_to_keysym (gunichar ch)
+/* =========================================================================
+ * LibVNC client callbacks
+ * ========================================================================= */
+
+static GstRfbSrc* gst_rfb_src_from_client(rfbClient* client)
 {
-  switch (ch) {
-    case '\b':
-      return XK_BackSpace;
-    case '\t':
-      return XK_Tab;
-    case '\n':
-    case '\r':
-      return XK_Return;
-    case 0x7f:
-      return XK_Delete;
-    default:
-      break;
-  }
-
-  if (ch <= 0xff)
-    return ch;
-
-  return 0x01000000 | ch;
+  return rfbClientGetClientData(client, &gst_rfb_src_client_data_tag);
 }
 
-/* Shared lookup table for DOM nav/editing keys that have both a standard and
- * a KP keysym; kp_keysym == 0 means no standard equivalent for that key. */
-typedef struct { const gchar *dom_key; guint keysym; guint kp_keysym; } GstRfbDomNavKey;
-static const GstRfbDomNavKey dom_nav_keys[] = {
-  { "Enter",     XK_Return,    XK_KP_Enter     },
-  { "Delete",    XK_Delete,    XK_KP_Delete    },
-  { "Insert",    XK_Insert,    XK_KP_Insert    },
-  { "Home",      XK_Home,      XK_KP_Home      },
-  { "End",       XK_End,       XK_KP_End       },
-  { "PageUp",    XK_Page_Up,   XK_KP_Page_Up   },
-  { "PageDown",  XK_Page_Down, XK_KP_Page_Down },
-  { "ArrowLeft", XK_Left,      XK_KP_Left      },
-  { "ArrowRight",XK_Right,     XK_KP_Right     },
-  { "ArrowUp",   XK_Up,        XK_KP_Up        },
-  { "ArrowDown", XK_Down,      XK_KP_Down      },
-  { "Clear",     XK_Clear,     XK_KP_Begin     },
-};
-
-/* Maps a DOM KeyboardEvent (key, code, location) to an RFB/X11 keysym.
- * location: 0=standard, 1=left, 2=right, 3=numpad */
-static guint
-gst_rfb_src_dom_key_to_keysym (const gchar * key, gint location)
+static char* gst_rfb_src_get_password(rfbClient* client)
 {
-  gchar *end;
-  guint64 parsed;
-  guint i;
+  GstRfbSrc* src = gst_rfb_src_from_client(client);
 
-  if (key == NULL || *key == '\0')
-    return 0;
-
-  /* Numpad keys (location == 3): digits, punctuation, and navigation */
-  if (location == 3) {
-    if (key[1] == '\0' && key[0] >= '0' && key[0] <= '9')
-      return XK_KP_0 + (guint) (key[0] - '0');
-    if (strcmp (key, ".") == 0)         return XK_KP_Decimal;
-    if (strcmp (key, ",") == 0)         return XK_KP_Separator;
-    if (strcmp (key, "/") == 0)         return XK_KP_Divide;
-    if (strcmp (key, "*") == 0)         return XK_KP_Multiply;
-    if (strcmp (key, "-") == 0)         return XK_KP_Subtract;
-    if (strcmp (key, "+") == 0)         return XK_KP_Add;
-    /* NumLock-off navigation, Enter, and Clear: look up in shared table */
-    for (i = 0; i < G_N_ELEMENTS (dom_nav_keys); i++) {
-      if (strcmp (key, dom_nav_keys[i].dom_key) == 0)
-        return dom_nav_keys[i].kp_keysym;
-    }
+  if (src == NULL || src->password == NULL) {
+    return strdup("");
   }
 
-  /* Named non-printable keys */
-  if (strcmp (key, "Backspace") == 0)   return XK_BackSpace;
-  if (strcmp (key, "Tab") == 0)         return XK_Tab;
-  if (strcmp (key, "Escape") == 0)      return XK_Escape;
-  if (strcmp (key, "CapsLock") == 0)    return XK_Caps_Lock;
-  if (strcmp (key, "NumLock") == 0)     return XK_Num_Lock;
-  if (strcmp (key, "ScrollLock") == 0)  return XK_Scroll_Lock;
-  if (strcmp (key, "Pause") == 0)       return XK_Pause;
-  if (strcmp (key, "PrintScreen") == 0) return XK_Print;
-  if (strcmp (key, "ContextMenu") == 0) return XK_Menu;
-  /* Navigation and editing keys shared with numpad */
-  for (i = 0; i < G_N_ELEMENTS (dom_nav_keys); i++) {
-    if (dom_nav_keys[i].keysym != 0 && strcmp (key, dom_nav_keys[i].dom_key) == 0)
-      return dom_nav_keys[i].keysym;
-  }
-
-  /* Modifier keys: location disambiguates left (1) vs right (2) */
-  if (strcmp (key, "Shift") == 0)
-    return location == 2 ? XK_Shift_R : XK_Shift_L;
-  if (strcmp (key, "Control") == 0)
-    return location == 2 ? XK_Control_R : XK_Control_L;
-  if (strcmp (key, "Alt") == 0)
-    return location == 2 ? XK_Alt_R : XK_Alt_L;
-  if (strcmp (key, "AltGraph") == 0)
-    return XK_ISO_Level3_Shift;
-  if (strcmp (key, "Meta") == 0)
-    return location == 2 ? XK_Meta_R : XK_Meta_L;
-  if (strcmp (key, "OS") == 0 || strcmp (key, "Super") == 0)
-    return location == 2 ? XK_Super_R : XK_Super_L;
-  if (strcmp (key, "Hyper") == 0)
-    return location == 2 ? XK_Hyper_R : XK_Hyper_L;
-
-  /* Function keys F1..F35 */
-  if (key[0] == 'F' && g_ascii_isdigit (key[1])) {
-    end = NULL;
-    parsed = g_ascii_strtoull (key + 1, &end, 10);
-    if (end && end != key + 1 && *end == '\0' && parsed >= 1 && parsed <= 35)
-      return XK_F1 + (guint) parsed - 1;
-  }
-
-  /* Editing keys */
-  if (strcmp (key, "Undo") == 0)          return XK_Undo;
-  if (strcmp (key, "Redo") == 0)          return XK_Redo;
-
-  /* UI keys */
-  if (strcmp (key, "Again") == 0)         return XK_Redo;
-  if (strcmp (key, "Cancel") == 0)        return XK_Cancel;
-  if (strcmp (key, "Execute") == 0)       return XK_Execute;
-  if (strcmp (key, "Find") == 0)          return XK_Find;
-  if (strcmp (key, "Help") == 0)          return XK_Help;
-  if (strcmp (key, "Select") == 0)        return XK_Select;
-
-  /* IME / composition keys (common) */
-  if (strcmp (key, "AllCandidates") == 0)     return XK_MultipleCandidate;
-  if (strcmp (key, "Alphanumeric") == 0)      return XK_Eisu_Shift;
-  if (strcmp (key, "Compose") == 0)           return XK_Multi_key;
-  if (strcmp (key, "Convert") == 0)           return XK_Henkan;
-  if (strcmp (key, "GroupFirst") == 0)        return XK_ISO_First_Group;
-  if (strcmp (key, "GroupLast") == 0)         return XK_ISO_Last_Group;
-  if (strcmp (key, "GroupNext") == 0)         return XK_ISO_Next_Group;
-  if (strcmp (key, "GroupPrevious") == 0)     return XK_ISO_Prev_Group;
-  if (strcmp (key, "ModeChange") == 0)        return XK_Mode_switch;
-  if (strcmp (key, "NonConvert") == 0)        return XK_Muhenkan;
-  if (strcmp (key, "PreviousCandidate") == 0) return XK_PreviousCandidate;
-  if (strcmp (key, "SingleCandidate") == 0)   return XK_SingleCandidate;
-
-  /* IME keys: Japanese */
-  if (strcmp (key, "Eisu") == 0)             return XK_Eisu_toggle;
-  if (strcmp (key, "Hankaku") == 0)          return XK_Hankaku;
-  if (strcmp (key, "Hiragana") == 0)         return XK_Hiragana;
-  if (strcmp (key, "HiraganaKatakana") == 0) return XK_Hiragana_Katakana;
-  if (strcmp (key, "KanaMode") == 0)         return XK_Kana_Lock;
-  if (strcmp (key, "KanjiMode") == 0)        return XK_Kanji;
-  if (strcmp (key, "Katakana") == 0)         return XK_Katakana;
-  if (strcmp (key, "Romaji") == 0)           return XK_Romaji;
-  if (strcmp (key, "Zenkaku") == 0)          return XK_Zenkaku;
-  if (strcmp (key, "ZenkakuHankaku") == 0)   return XK_Zenkaku_Hankaku;
-
-  /* Dead/compose keys and unidentified keys are not mappable */
-  if (strncmp (key, "Dead", 4) == 0 || strcmp (key, "Unidentified") == 0)
-    return 0;
-
-  /* Single Unicode character */
-  if (g_utf8_strlen (key, -1) == 1)
-    return gst_rfb_src_unicode_to_keysym (g_utf8_get_char (key));
-
-  return 0;
+  return strdup(src->password);
 }
 
-
-static GstRfbSrc *
-gst_rfb_src_from_client (rfbClient * client)
+static rfbCredential* gst_rfb_src_get_credential(rfbClient* client,
+                                                 int credential_type)
 {
-  return rfbClientGetClientData (client, &gst_rfb_src_client_data_tag);
-}
+  GstRfbSrc* src = gst_rfb_src_from_client(client);
+  rfbCredential* credential;
 
-static char *
-gst_rfb_src_get_password (rfbClient * client)
-{
-  GstRfbSrc *src = gst_rfb_src_from_client (client);
-
-  if (src == NULL || src->password == NULL)
-    return strdup ("");
-
-  return strdup (src->password);
-}
-
-static rfbCredential *
-gst_rfb_src_get_credential (rfbClient * client, int credential_type)
-{
-  GstRfbSrc *src = gst_rfb_src_from_client (client);
-  rfbCredential *credential;
-
-  if (src == NULL || credential_type != rfbCredentialTypeUser)
+  if (src == NULL || credential_type != rfbCredentialTypeUser) {
     return NULL;
+  }
 
-  credential = calloc (1, sizeof (*credential));
-  if (credential == NULL)
+  credential = calloc(1, sizeof(*credential));
+  if (credential == NULL) {
     return NULL;
+  }
 
   credential->userCredential.username =
-      strdup (src->username ? src->username : "");
+      strdup(src->username ? src->username : "");
   credential->userCredential.password =
-      strdup (src->password ? src->password : "");
+      strdup(src->password ? src->password : "");
 
   if (credential->userCredential.username == NULL ||
       credential->userCredential.password == NULL) {
-    free (credential->userCredential.username);
-    free (credential->userCredential.password);
-    free (credential);
+    free(credential->userCredential.username);
+    free(credential->userCredential.password);
+    free(credential);
     return NULL;
   }
 
   return credential;
 }
 
-static rfbBool
-gst_rfb_src_malloc_framebuffer (rfbClient * client)
+static rfbBool gst_rfb_src_malloc_framebuffer(rfbClient* client)
 {
-  GstRfbSrc *src = gst_rfb_src_from_client (client);
+  GstRfbSrc* src = gst_rfb_src_from_client(client);
   guint64 size;
-  guint8 *framebuffer;
+  guint8* framebuffer;
 
-  if (client->width <= 0 || client->height <= 0)
+  if (client->width <= 0 || client->height <= 0) {
     return GST_RFB_FALSE;
+  }
 
-  size = (guint64) client->width * client->height * 4;
-  if (size > G_MAXSIZE)
+  size = (guint64)client->width * client->height * 4;
+  if (size > G_MAXSIZE) {
     return GST_RFB_FALSE;
+  }
 
-  framebuffer = calloc (1, (size_t) size);
-  if (framebuffer == NULL)
+  framebuffer = calloc(1, (size_t)size);
+  if (framebuffer == NULL) {
     return GST_RFB_FALSE;
+  }
 
-  free (client->frameBuffer);
+  free(client->frameBuffer);
   client->frameBuffer = framebuffer;
 
   if (src) {
@@ -735,29 +531,29 @@ gst_rfb_src_malloc_framebuffer (rfbClient * client)
   return GST_RFB_TRUE;
 }
 
-static void
-gst_rfb_src_got_framebuffer_update (rfbClient * client, int x, int y,
-    int width, int height)
+static void gst_rfb_src_got_framebuffer_update(rfbClient* client, int x, int y,
+                                               int width, int height)
 {
-  GstRfbSrc *src = gst_rfb_src_from_client (client);
+  GstRfbSrc* src = gst_rfb_src_from_client(client);
 
-  if (src == NULL)
+  if (src == NULL) {
     return;
+  }
 
-  GST_LOG_OBJECT (src, "framebuffer update x=%d y=%d width=%d height=%d",
-      x, y, width, height);
+  GST_LOG_OBJECT(src, "framebuffer update x=%d y=%d width=%d height=%d", x, y,
+                 width, height);
   src->frame_dirty = TRUE;
   src->frame_valid = TRUE;
   src->update_request_pending = FALSE;
 }
 
-static void
-gst_rfb_src_finished_framebuffer_update (rfbClient * client)
+static void gst_rfb_src_finished_framebuffer_update(rfbClient* client)
 {
-  GstRfbSrc *src = gst_rfb_src_from_client (client);
+  GstRfbSrc* src = gst_rfb_src_from_client(client);
 
-  if (src == NULL)
+  if (src == NULL) {
     return;
+  }
 
   /* Do NOT set frame_dirty here — only GotFrameBufferUpdate (actual pixel
    * changes) or cursor callbacks set it.  That way wait_for_frame can tell
@@ -766,33 +562,13 @@ gst_rfb_src_finished_framebuffer_update (rfbClient * client)
   src->update_request_pending = FALSE;
 }
 
-static void
-gst_rfb_src_clear_cursor (GstRfbSrc * src)
+static rfbBool gst_rfb_src_handle_cursor_pos(rfbClient* client, int x, int y)
 {
-  g_clear_pointer (&src->cursor_source, g_free);
-  g_clear_pointer (&src->cursor_mask, g_free);
-  src->cursor_source_size = 0;
-  src->cursor_mask_size = 0;
-  src->cursor_shape_valid = FALSE;
-  src->cursor_position_valid = FALSE;
-  src->cursor_client_requested = FALSE;
-  src->cursor_auto_fallback_frames = 0;
-  src->cursor_x = 0;
-  src->cursor_y = 0;
-  src->cursor_hot_x = 0;
-  src->cursor_hot_y = 0;
-  src->cursor_width = 0;
-  src->cursor_height = 0;
-  src->cursor_bpp = 0;
-}
+  GstRfbSrc* src = gst_rfb_src_from_client(client);
 
-static rfbBool
-gst_rfb_src_handle_cursor_pos (rfbClient * client, int x, int y)
-{
-  GstRfbSrc *src = gst_rfb_src_from_client (client);
-
-  if (src == NULL)
+  if (src == NULL) {
     return GST_RFB_TRUE;
+  }
 
   src->cursor_x = x;
   src->cursor_y = y;
@@ -800,52 +576,50 @@ gst_rfb_src_handle_cursor_pos (rfbClient * client, int x, int y)
   src->frame_dirty = TRUE;
   src->cursor_dirty = TRUE;
 
-  GST_LOG_OBJECT (src, "cursor position x=%d y=%d", x, y);
+  GST_LOG_OBJECT(src, "cursor position x=%d y=%d", x, y);
 
   return GST_RFB_TRUE;
 }
 
-static void
-gst_rfb_src_got_cursor_shape (rfbClient * client, int xhot, int yhot,
-    int width, int height, int bytes_per_pixel)
+static void gst_rfb_src_got_cursor_shape(rfbClient* client, int xhot, int yhot,
+                                         int width, int height,
+                                         int bytes_per_pixel)
 {
-  GstRfbSrc *src = gst_rfb_src_from_client (client);
+  GstRfbSrc* src = gst_rfb_src_from_client(client);
   guint64 source_size;
   guint64 mask_size;
 
-  if (src == NULL)
+  if (src == NULL) {
     return;
+  }
 
   if (width <= 0 || height <= 0 || bytes_per_pixel <= 0 ||
       bytes_per_pixel > 4) {
-    GST_WARNING_OBJECT (src, "ignoring invalid cursor shape %dx%d bpp=%d",
-        width, height, bytes_per_pixel);
+    GST_WARNING_OBJECT(src, "ignoring invalid cursor shape %dx%d bpp=%d", width,
+                       height, bytes_per_pixel);
     src->cursor_shape_valid = FALSE;
     return;
   }
 
-  source_size = (guint64) width * height * bytes_per_pixel;
+  source_size = (guint64)width * height * bytes_per_pixel;
   /* libvncclient expands the packed RFB mask to one byte per pixel (0 or 1) */
-  mask_size = (guint64) width * height;
+  mask_size = (guint64)width * height;
   if (source_size > G_MAXSIZE || mask_size > G_MAXSIZE ||
       client->rcSource == NULL) {
-    GST_WARNING_OBJECT (src, "ignoring cursor shape with invalid buffers");
+    GST_WARNING_OBJECT(src, "ignoring cursor shape with invalid buffers");
     src->cursor_shape_valid = FALSE;
     return;
   }
 
-  g_free (src->cursor_source);
-  g_free (src->cursor_mask);
-  src->cursor_source = g_memdup2 (client->rcSource,
-      (gsize) source_size);
-  src->cursor_mask = client->rcMask ?
-      g_memdup2 (client->rcMask, (gsize) mask_size) : NULL;
-  src->cursor_source_size = (gsize) source_size;
-  src->cursor_mask_size = client->rcMask ? (gsize) mask_size : 0;
+  g_free(src->cursor_source);
+  g_free(src->cursor_mask);
+  src->cursor_source = g_memdup2(client->rcSource, (gsize)source_size);
+  src->cursor_mask =
+      client->rcMask ? g_memdup2(client->rcMask, (gsize)mask_size) : NULL;
 
   if (src->cursor_source == NULL ||
       (client->rcMask != NULL && src->cursor_mask == NULL)) {
-    GST_WARNING_OBJECT (src, "could not copy cursor shape");
+    GST_WARNING_OBJECT(src, "could not copy cursor shape");
     src->cursor_shape_valid = FALSE;
     return;
   }
@@ -860,32 +634,162 @@ gst_rfb_src_got_cursor_shape (rfbClient * client, int xhot, int yhot,
   src->frame_dirty = TRUE;
   src->cursor_dirty = TRUE;
 
-  GST_DEBUG_OBJECT (src, "cursor shape %dx%d hot=%d,%d bpp=%d", width,
-      height, xhot, yhot, bytes_per_pixel);
+  GST_DEBUG_OBJECT(src, "cursor shape %dx%d hot=%d,%d bpp=%d", width, height,
+                   xhot, yhot, bytes_per_pixel);
 }
 
-static gboolean
-gst_rfb_src_compute_output_rect (GstRfbSrc * src, gint * x, gint * y,
-    gint * width, gint * height)
+/* =========================================================================
+ * Cursor management: state, fallback, and compositing
+ * ========================================================================= */
+
+static void gst_rfb_src_clear_cursor(GstRfbSrc* src)
+{
+  g_clear_pointer(&src->cursor_source, g_free);
+  g_clear_pointer(&src->cursor_mask, g_free);
+  src->cursor_shape_valid = FALSE;
+  src->cursor_position_valid = FALSE;
+  src->cursor_client_requested = FALSE;
+  src->cursor_auto_fallback_frames = 0;
+  src->cursor_x = 0;
+  src->cursor_y = 0;
+  src->cursor_hot_x = 0;
+  src->cursor_hot_y = 0;
+  src->cursor_width = 0;
+  src->cursor_height = 0;
+  src->cursor_bpp = 0;
+}
+
+static gboolean gst_rfb_src_cursor_is_usable(GstRfbSrc* src)
+{
+  return src->cursor_client_requested && src->cursor_shape_valid &&
+         src->cursor_position_valid &&
+         src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_NONE;
+}
+
+/* If in AUTO mode and no usable client cursor has arrived after
+ * DEFAULT_CURSOR_FALLBACK_FRAMES frames, switch to server-drawn cursor. */
+static void gst_rfb_src_maybe_fallback_cursor(GstRfbSrc* src)
+{
+  if (src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_AUTO ||
+      !src->cursor_client_requested ||
+      (src->cursor_shape_valid && src->cursor_position_valid)) {
+    return;
+  }
+
+  src->cursor_auto_fallback_frames++;
+  if (src->cursor_auto_fallback_frames < DEFAULT_CURSOR_FALLBACK_FRAMES) {
+    return;
+  }
+
+  GST_INFO_OBJECT(src,
+                  "no usable remote cursor received; "
+                  "falling back to server-drawn cursor");
+
+  gst_rfb_src_clear_cursor(src);
+  src->cursor_client_requested = FALSE;
+  src->client->appData.useRemoteCursor = GST_RFB_FALSE;
+
+  {
+    GstRfbSrc* prev_log = gst_rfb_src_log_ctx_enter(src);
+    rfbBool fmt_ok = SetFormatAndEncodings(src->client);
+
+    gst_rfb_src_log_ctx_leave(prev_log);
+    if (!fmt_ok) {
+      GST_WARNING_OBJECT(src,
+                         "could not renegotiate server-drawn cursor fallback");
+    }
+  }
+}
+
+/* Composite the client-side cursor onto the output frame buffer.
+ * Clamps the cursor rect to the output area; no-ops if cursor is off-screen
+ * or not usable. */
+static void gst_rfb_src_draw_cursor(GstRfbSrc* src, GstMapInfo* map,
+                                    gsize output_stride)
+{
+  gint rel_x, rel_y;
+  gint start_x, start_y, end_x, end_y;
+  gsize src_bpp;
+  gint y;
+
+  if (!gst_rfb_src_cursor_is_usable(src)) {
+    return;
+  }
+
+  if (src->cursor_bpp != 4 && src->cursor_bpp != 3) {
+    GST_LOG_OBJECT(src, "skipping unsupported cursor bpp=%d", src->cursor_bpp);
+    return;
+  }
+
+  rel_x = src->cursor_x - src->cursor_hot_x - src->offset_x;
+  rel_y = src->cursor_y - src->cursor_hot_y - src->offset_y;
+  start_x = MAX(0, -rel_x);
+  start_y = MAX(0, -rel_y);
+  end_x = MIN(src->cursor_width, src->output_width - rel_x);
+  end_y = MIN(src->cursor_height, src->output_height - rel_y);
+
+  if (start_x >= end_x || start_y >= end_y) {
+    return;
+  }
+
+  /* Clamp logic above guarantees src and dst offsets stay in bounds. */
+  src_bpp = (gsize)src->cursor_bpp;
+
+  for (y = start_y; y < end_y; y++) {
+    const guint8* src_px = src->cursor_source +
+                           (gsize)y * src->cursor_width * src_bpp +
+                           (gsize)start_x * src_bpp;
+    guint8* dst_px = (guint8*)map->data + (gsize)(rel_y + y) * output_stride +
+                     (gsize)(rel_x + start_x) * 4;
+    /* libvncclient expands the packed RFB 1bpp mask to one byte per pixel. */
+    const guint8* mask_row =
+        src->cursor_mask ? src->cursor_mask + (gsize)y * src->cursor_width
+                         : NULL;
+    gint x;
+
+    for (x = start_x; x < end_x; x++, src_px += src_bpp, dst_px += 4) {
+      if (mask_row && mask_row[x] == 0) {
+        continue;
+      }
+
+      dst_px[0] = src_px[0];
+      dst_px[1] = src_px[1];
+      dst_px[2] = src_px[2];
+      dst_px[3] = 0xff;
+    }
+  }
+}
+
+/* =========================================================================
+ * Capture geometry and GStreamer caps
+ * ========================================================================= */
+
+/* Computes the capture rectangle given the current server size and user-
+ * requested offset/width/height, clamping to the available server area.
+ * Posts an error and returns FALSE if the geometry is invalid. */
+static gboolean gst_rfb_src_compute_output_rect(GstRfbSrc* src, gint* x,
+                                                gint* y, gint* width,
+                                                gint* height)
 {
   gint max_width;
   gint max_height;
 
   if (src->server_width <= 0 || src->server_height <= 0) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-        "validate-geometry", "invalid-framebuffer-size",
-        "VNC server reported invalid framebuffer size %dx%d",
-        src->server_width, src->server_height);
+    gst_rfb_src_post_resource_error(
+        src, GST_RESOURCE_ERROR_READ, "validate-geometry",
+        "invalid-framebuffer-size",
+        "VNC server reported invalid framebuffer size %dx%d", src->server_width,
+        src->server_height);
     return FALSE;
   }
 
   if (src->offset_x < 0 || src->offset_x >= src->server_width ||
       src->offset_y < 0 || src->offset_y >= src->server_height) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
-        "validate-geometry", "capture-area-invalid",
-        "Capture offset %d,%d outside VNC framebuffer %dx%d",
-        src->offset_x, src->offset_y, src->server_width,
-        src->server_height);
+    gst_rfb_src_post_resource_error(
+        src, GST_RESOURCE_ERROR_SETTINGS, "validate-geometry",
+        "capture-area-invalid",
+        "Capture offset %d,%d outside VNC framebuffer %dx%d", src->offset_x,
+        src->offset_y, src->server_width, src->server_height);
     return FALSE;
   }
 
@@ -898,136 +802,168 @@ gst_rfb_src_compute_output_rect (GstRfbSrc * src, gint * x, gint * y,
   *height = src->requested_height > 0 ? src->requested_height : max_height;
 
   if (*width > max_width) {
-    GST_WARNING_OBJECT (src, "Requested width %d exceeds server area, "
-        "clamping to %d", *width, max_width);
+    GST_WARNING_OBJECT(src,
+                       "Requested width %d exceeds server area, "
+                       "clamping to %d",
+                       *width, max_width);
     *width = max_width;
   }
   if (*height > max_height) {
-    GST_WARNING_OBJECT (src, "Requested height %d exceeds server area, "
-        "clamping to %d", *height, max_height);
+    GST_WARNING_OBJECT(src,
+                       "Requested height %d exceeds server area, "
+                       "clamping to %d",
+                       *height, max_height);
     *height = max_height;
   }
 
   if (*width <= 0 || *height <= 0) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
-        "validate-geometry", "capture-area-invalid",
-        "Capture area %dx%d is empty", *width, *height);
+    gst_rfb_src_post_resource_error(
+        src, GST_RESOURCE_ERROR_SETTINGS, "validate-geometry",
+        "capture-area-invalid", "Capture area %dx%d is empty", *width, *height);
     return FALSE;
   }
 
   return TRUE;
 }
 
-static gboolean
-gst_rfb_src_update_caps (GstRfbSrc * src)
+static gboolean gst_rfb_src_update_caps(GstRfbSrc* src)
 {
-  GstCaps *caps;
+  GstCaps* caps;
   gint x, y, width, height;
 
-  if (!gst_rfb_src_compute_output_rect (src, &x, &y, &width, &height))
-    return FALSE;
-
-  if (src->have_caps && src->output_x == x && src->output_y == y &&
-      src->output_width == width && src->output_height == height)
-    return TRUE;
-
-  gst_video_info_set_format (&src->vinfo, GST_VIDEO_FORMAT_BGRx, width, height);
-  GST_VIDEO_INFO_FPS_N (&src->vinfo) = src->max_framerate;
-  GST_VIDEO_INFO_FPS_D (&src->vinfo) = 1;
-
-  caps = gst_video_info_to_caps (&src->vinfo);
-  if (caps == NULL) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
-        "negotiate-caps", "caps-allocation-failed",
-        "Could not allocate output caps");
+  if (!gst_rfb_src_compute_output_rect(src, &x, &y, &width, &height)) {
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT (src, "setting caps %" GST_PTR_FORMAT, caps);
+  /* No-op when neither geometry nor offset changed */
+  if (src->have_caps && src->offset_x == x && src->offset_y == y &&
+      src->output_width == width && src->output_height == height) {
+    return TRUE;
+  }
 
-  if (!gst_base_src_set_caps (GST_BASE_SRC (src), caps)) {
-    gst_caps_unref (caps);
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
-        "negotiate-caps", "caps-negotiation-failed",
-        "Could not negotiate VNC output caps");
+  gst_video_info_set_format(&src->vinfo, GST_VIDEO_FORMAT_BGRx, width, height);
+  GST_VIDEO_INFO_FPS_N(&src->vinfo) = src->max_framerate;
+  GST_VIDEO_INFO_FPS_D(&src->vinfo) = 1;
+
+  caps = gst_video_info_to_caps(&src->vinfo);
+  if (caps == NULL) {
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
+                                    "negotiate-caps", "caps-allocation-failed",
+                                    "Could not allocate output caps");
+    return FALSE;
+  }
+
+  GST_DEBUG_OBJECT(src, "setting caps %" GST_PTR_FORMAT, caps);
+
+  if (!gst_base_src_set_caps(GST_BASE_SRC(src), caps)) {
+    gst_caps_unref(caps);
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_SETTINGS,
+                                    "negotiate-caps", "caps-negotiation-failed",
+                                    "Could not negotiate VNC output caps");
     return FALSE;
   }
 
   {
-    GstBufferPool *old_pool = src->pool;
-    GstBufferPool *new_pool = gst_video_buffer_pool_new ();
-    GstStructure *config = gst_buffer_pool_get_config (new_pool);
+    GstBufferPool* old_pool = src->pool;
+    GstBufferPool* new_pool = gst_video_buffer_pool_new();
+    GstStructure* config = gst_buffer_pool_get_config(new_pool);
 
-    gst_buffer_pool_config_set_params (config, caps,
-        GST_VIDEO_INFO_SIZE (&src->vinfo), 2, 0);
-    gst_buffer_pool_set_config (new_pool, config);
-    gst_buffer_pool_set_active (new_pool, TRUE);
+    gst_buffer_pool_config_set_params(config, caps,
+                                      GST_VIDEO_INFO_SIZE(&src->vinfo), 2, 0);
+    gst_buffer_pool_set_config(new_pool, config);
+    gst_buffer_pool_set_active(new_pool, TRUE);
     src->pool = new_pool;
 
     if (old_pool) {
-      gst_buffer_pool_set_active (old_pool, FALSE);
-      gst_object_unref (old_pool);
+      gst_buffer_pool_set_active(old_pool, FALSE);
+      gst_object_unref(old_pool);
     }
   }
 
-  gst_caps_unref (caps);
+  gst_caps_unref(caps);
 
-  src->output_x = x;
-  src->output_y = y;
   src->output_width = width;
   src->output_height = height;
   src->frame_duration =
-      gst_util_uint64_scale_int (GST_SECOND, 1, src->max_framerate);
+      gst_util_uint64_scale_int(GST_SECOND, 1, src->max_framerate);
   src->have_caps = TRUE;
 
   return TRUE;
 }
 
-static void
-gst_rfb_src_sync_client_update_rect (GstRfbSrc * src)
+/* Pushes the current output rect into the libvnc client so the server only
+ * sends updates for the captured sub-region. */
+static void gst_rfb_src_sync_client_update_rect(GstRfbSrc* src)
 {
-  if (src->client == NULL)
+  if (src->client == NULL) {
     return;
+  }
 
-  src->client->updateRect.x = src->output_x;
-  src->client->updateRect.y = src->output_y;
+  src->client->updateRect.x = src->offset_x;
+  src->client->updateRect.y = src->offset_y;
   src->client->updateRect.w = src->output_width;
   src->client->updateRect.h = src->output_height;
 }
 
-static gboolean
-gst_rfb_src_open (GstRfbSrc * src)
+/* =========================================================================
+ * Connection management: open and close
+ * ========================================================================= */
+
+static void gst_rfb_src_configure_socket_low_latency(GstRfbSrc* src)
 {
-  rfbClient *client;
-  const gchar *encodings;
+#if GST_RFB_SRC_HAVE_TCP_NODELAY
+  int enabled = 1;
 
-  if (src->connected)
+  if (src->client == NULL || src->client->sock == RFB_INVALID_SOCKET) {
+    return;
+  }
+
+  if (setsockopt(src->client->sock, IPPROTO_TCP, TCP_NODELAY,
+                 (const void*)&enabled, sizeof(enabled)) != 0) {
+    GST_WARNING_OBJECT(src, "could not enable TCP_NODELAY on VNC socket");
+  }
+  else {
+    GST_DEBUG_OBJECT(src, "enabled TCP_NODELAY on VNC socket");
+  }
+#else
+  (void)src;
+#endif
+}
+
+static gboolean gst_rfb_src_open(GstRfbSrc* src)
+{
+  rfbClient* client;
+  const gchar* encodings;
+
+  if (src->connected) {
     return TRUE;
+  }
 
-  g_return_val_if_fail (src->client == NULL, FALSE);
+  g_return_val_if_fail(src->client == NULL, FALSE);
 
-  g_clear_pointer (&src->last_libvnc_error, g_free);
+  g_clear_pointer(&src->last_libvnc_error, g_free);
 
   if (src->host == NULL || *src->host == '\0') {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_SETTINGS,
-        "settings", "host-empty", "VNC host is empty");
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_SETTINGS,
+                                    "settings", "host-empty",
+                                    "VNC host is empty");
     return FALSE;
   }
 
-  client = rfbGetClient (8, 3, 4);
+  client = rfbGetClient(8, 3, 4);
   if (client == NULL) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_FAILED,
-        "allocate-client", "allocation-failed",
-        "Could not allocate libvncclient client");
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_FAILED,
+                                    "allocate-client", "allocation-failed",
+                                    "Could not allocate libvncclient client");
     return FALSE;
   }
 
   src->client = client;
-  gst_rfb_src_clear_cursor (src);
+  gst_rfb_src_clear_cursor(src);
   src->cursor_client_requested =
       src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_SERVER;
 
-  rfbClientSetClientData (client, &gst_rfb_src_client_data_tag, src);
+  rfbClientSetClientData(client, &gst_rfb_src_client_data_tag, src);
   client->MallocFrameBuffer = gst_rfb_src_malloc_framebuffer;
   client->GotFrameBufferUpdate = gst_rfb_src_got_framebuffer_update;
   client->FinishedFrameBufferUpdate = gst_rfb_src_finished_framebuffer_update;
@@ -1058,46 +994,46 @@ gst_rfb_src_open (GstRfbSrc * src)
   client->format.blueShift = 0;
 
   encodings = src->encodings ? src->encodings : DEFAULT_PROP_ENCODINGS;
-  g_clear_pointer (&src->active_encodings, g_free);
-  if (src->use_copyrect && strstr (encodings, "copyrect") == NULL) {
-    src->active_encodings = g_strconcat ("copyrect ", encodings, NULL);
-  } else {
-    src->active_encodings = g_strdup (encodings);
+  g_clear_pointer(&src->active_encodings, g_free);
+  if (src->use_copyrect && strstr(encodings, "copyrect") == NULL) {
+    src->active_encodings = g_strconcat("copyrect ", encodings, NULL);
+  }
+  else {
+    src->active_encodings = g_strdup(encodings);
   }
   client->appData.encodingsString = src->active_encodings;
 
-  GST_DEBUG_OBJECT (src, "connecting to VNC server %s:%d", src->host,
-      src->port);
+  GST_DEBUG_OBJECT(src, "connecting to VNC server %s:%d", src->host, src->port);
 
   {
-    GstRfbSrc *prev_log = gst_rfb_src_log_ctx_enter (src);
-    rfbBool ok = ConnectToRFBServer (client, src->host, src->port);
+    GstRfbSrc* prev_log = gst_rfb_src_log_ctx_enter(src);
+    rfbBool ok = ConnectToRFBServer(client, src->host, src->port);
 
-    gst_rfb_src_log_ctx_leave (prev_log);
+    gst_rfb_src_log_ctx_leave(prev_log);
     if (!ok) {
-      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_OPEN_READ,
-          "connect", "connection-failed",
+      gst_rfb_src_post_resource_error(
+          src, GST_RESOURCE_ERROR_OPEN_READ, "connect", "connection-failed",
           "Could not connect to VNC server %s:%d", src->host, src->port);
       goto fail;
     }
-    g_clear_pointer (&src->last_libvnc_error, g_free);
+    g_clear_pointer(&src->last_libvnc_error, g_free);
   }
 
-  gst_rfb_src_configure_socket_low_latency (src);
+  gst_rfb_src_configure_socket_low_latency(src);
 
   {
-    GstRfbSrc *prev_log = gst_rfb_src_log_ctx_enter (src);
-    rfbBool ok = InitialiseRFBConnection (client);
+    GstRfbSrc* prev_log = gst_rfb_src_log_ctx_enter(src);
+    rfbBool ok = InitialiseRFBConnection(client);
 
-    gst_rfb_src_log_ctx_leave (prev_log);
+    gst_rfb_src_log_ctx_leave(prev_log);
     if (!ok) {
-      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-          "initialise", gst_rfb_src_classify_initialise_failure (src),
-          "Could not initialize VNC connection to %s:%d", src->host,
-          src->port);
+      gst_rfb_src_post_resource_error(
+          src, GST_RESOURCE_ERROR_READ, "initialise",
+          gst_rfb_src_classify_initialise_failure(src),
+          "Could not initialize VNC connection to %s:%d", src->host, src->port);
       goto fail;
     }
-    g_clear_pointer (&src->last_libvnc_error, g_free);
+    g_clear_pointer(&src->last_libvnc_error, g_free);
   }
 
   if (client->width <= 0 || client->height <= 0) {
@@ -1106,34 +1042,34 @@ gst_rfb_src_open (GstRfbSrc * src)
   }
 
   if (client->width <= 0 || client->height <= 0) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-        "initialise", "invalid-framebuffer-size",
-        "VNC server reported invalid framebuffer size %dx%d",
-        client->width, client->height);
-    goto fail;
-  }
-
-  if (client->frameBuffer == NULL && !client->MallocFrameBuffer (client)) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
-        "allocate-framebuffer", "allocation-failed",
-        "Could not allocate %dx%d VNC framebuffer", client->width,
+    gst_rfb_src_post_resource_error(
+        src, GST_RESOURCE_ERROR_READ, "initialise", "invalid-framebuffer-size",
+        "VNC server reported invalid framebuffer size %dx%d", client->width,
         client->height);
     goto fail;
   }
 
-  {
-    GstRfbSrc *prev_log = gst_rfb_src_log_ctx_enter (src);
-    rfbBool ok = SetFormatAndEncodings (client);
+  if (client->frameBuffer == NULL && !client->MallocFrameBuffer(client)) {
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
+                                    "allocate-framebuffer", "allocation-failed",
+                                    "Could not allocate %dx%d VNC framebuffer",
+                                    client->width, client->height);
+    goto fail;
+  }
 
-    gst_rfb_src_log_ctx_leave (prev_log);
+  {
+    GstRfbSrc* prev_log = gst_rfb_src_log_ctx_enter(src);
+    rfbBool ok = SetFormatAndEncodings(client);
+
+    gst_rfb_src_log_ctx_leave(prev_log);
     if (!ok) {
-      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_WRITE,
-          "set-format", "setup-failed",
+      gst_rfb_src_post_resource_error(
+          src, GST_RESOURCE_ERROR_WRITE, "set-format", "setup-failed",
           "Could not send VNC pixel format/encodings to %s:%d", src->host,
           src->port);
       goto fail;
     }
-    g_clear_pointer (&src->last_libvnc_error, g_free);
+    g_clear_pointer(&src->last_libvnc_error, g_free);
   }
 
   src->server_width = client->width;
@@ -1141,29 +1077,30 @@ gst_rfb_src_open (GstRfbSrc * src)
   src->connected = TRUE;
   src->geometry_changed = TRUE;
 
-  GST_INFO_OBJECT (src, "connected to VNC server %s:%d, desktop=%dx%d, "
-      "protocol=%d.%d", src->host, src->port, client->width, client->height,
-      client->major, client->minor);
+  GST_INFO_OBJECT(
+      src, "connected to VNC server %s:%d, desktop=%dx%d, protocol=%d.%d",
+      src->host, src->port, client->width, client->height, client->major,
+      client->minor);
 
-  if (!gst_rfb_src_update_caps (src))
+  if (!gst_rfb_src_update_caps(src)) {
     goto fail;
+  }
 
-  gst_rfb_src_sync_client_update_rect (src);
+  gst_rfb_src_sync_client_update_rect(src);
 
   return TRUE;
 
 fail:
-  rfbClientCleanup (client);
+  rfbClientCleanup(client);
   src->client = NULL;
   src->connected = FALSE;
   return FALSE;
 }
 
-static void
-gst_rfb_src_close (GstRfbSrc * src)
+static void gst_rfb_src_close(GstRfbSrc* src)
 {
   if (src->client) {
-    rfbClientCleanup (src->client);
+    rfbClientCleanup(src->client);
     src->client = NULL;
   }
 
@@ -1177,28 +1114,33 @@ gst_rfb_src_close (GstRfbSrc * src)
   src->server_width = 0;
   src->server_height = 0;
   src->button_mask = 0;
-  gst_rfb_src_clear_pending_pointer (src);
-  if (src->pressed_keys)
-    g_hash_table_remove_all (src->pressed_keys);
-  g_clear_pointer (&src->active_encodings, g_free);
-  g_clear_pointer (&src->last_libvnc_error, g_free);
-  gst_rfb_src_clear_cursor (src);
+  gst_rfb_src_clear_pending_pointer(src);
+  if (src->pressed_keys) {
+    g_hash_table_remove_all(src->pressed_keys);
+  }
+  g_clear_pointer(&src->active_encodings, g_free);
+  g_clear_pointer(&src->last_libvnc_error, g_free);
+  gst_rfb_src_clear_cursor(src);
 
   if (src->pool) {
-    gst_buffer_pool_set_active (src->pool, FALSE);
-    g_clear_object (&src->pool);
+    gst_buffer_pool_set_active(src->pool, FALSE);
+    g_clear_object(&src->pool);
   }
 }
 
-static gboolean
-gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
+/* =========================================================================
+ * Frame pipeline: update requests, waiting, and copying
+ * ========================================================================= */
+
+static gboolean gst_rfb_src_send_framebuffer_update_request(GstRfbSrc* src)
 {
   gboolean incremental;
-  GstRfbSrc *prev_log;
+  GstRfbSrc* prev_log;
   rfbBool ok;
 
-  if (src->update_request_pending)
+  if (src->update_request_pending) {
     return TRUE;
+  }
 
   /* Always request incremental updates from the server after the first full
    * frame so the server only sends changed rects.  The incremental_update
@@ -1207,32 +1149,31 @@ gst_rfb_src_send_framebuffer_update_request (GstRfbSrc * src)
   incremental = src->frame_valid;
   src->frame_dirty = FALSE;
 
-  prev_log = gst_rfb_src_log_ctx_enter (src);
-  ok = SendFramebufferUpdateRequest (src->client, src->output_x,
-      src->output_y, src->output_width, src->output_height,
-      incremental ? GST_RFB_TRUE : GST_RFB_FALSE);
-  gst_rfb_src_log_ctx_leave (prev_log);
+  prev_log = gst_rfb_src_log_ctx_enter(src);
+  ok = SendFramebufferUpdateRequest(src->client, src->offset_x, src->offset_y,
+                                    src->output_width, src->output_height,
+                                    incremental ? GST_RFB_TRUE : GST_RFB_FALSE);
+  gst_rfb_src_log_ctx_leave(prev_log);
 
   if (!ok) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_WRITE,
-        "request-frame",
-        gst_rfb_src_classify_io_failure (src,
-            "framebuffer-update-request-failed"),
+    gst_rfb_src_post_resource_error(
+        src, GST_RESOURCE_ERROR_WRITE, "request-frame",
+        gst_rfb_src_classify_io_failure(src,
+                                        "framebuffer-update-request-failed"),
         "Could not request VNC framebuffer update");
     return FALSE;
   }
-  g_clear_pointer (&src->last_libvnc_error, g_free);
+  g_clear_pointer(&src->last_libvnc_error, g_free);
 
   src->update_request_pending = TRUE;
-  GST_LOG_OBJECT (src, "sent %s framebuffer update request x=%d y=%d %dx%d",
-      incremental ? "incremental" : "full", src->output_x, src->output_y,
-      src->output_width, src->output_height);
+  GST_LOG_OBJECT(src, "sent %s framebuffer update request x=%d y=%d %dx%d",
+                 incremental ? "incremental" : "full", src->offset_x,
+                 src->offset_y, src->output_width, src->output_height);
 
   return TRUE;
 }
 
-static gboolean
-gst_rfb_src_wait_for_frame (GstRfbSrc * src)
+static gboolean gst_rfb_src_wait_for_frame(GstRfbSrc* src)
 {
   GstClockTime now;
   GstClockTime deadline;
@@ -1241,18 +1182,21 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
   gboolean need_first_frame;
 
   need_first_frame = !src->frame_valid;
-  now = gst_util_get_timestamp ();
+  now = gst_util_get_timestamp();
 
   if (need_first_frame) {
     timeout_deadline = now + src->frame_timeout_ms * GST_MSECOND;
     deadline = timeout_deadline;
     first_frame_retry_deadline = now + 500 * GST_MSECOND;
-  } else if (GST_CLOCK_TIME_IS_VALID (src->last_frame_time)) {
+  }
+  else if (GST_CLOCK_TIME_IS_VALID(src->last_frame_time)) {
     deadline = src->last_frame_time + src->frame_duration;
     timeout_deadline = now + src->frame_timeout_ms * GST_MSECOND;
-    if (deadline > timeout_deadline)
+    if (deadline > timeout_deadline) {
       deadline = timeout_deadline;
-  } else {
+    }
+  }
+  else {
     deadline = now;
     timeout_deadline = now + src->frame_timeout_ms * GST_MSECOND;
   }
@@ -1262,24 +1206,27 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
     guint wait_usecs;
     int ret;
 
-    if (gst_rfb_src_is_unlocked (src))
+    if (gst_rfb_src_is_unlocked(src)) {
       return FALSE;
+    }
 
-    if (need_first_frame && src->frame_valid)
+    if (need_first_frame && src->frame_valid) {
       return TRUE;
+    }
 
-    now = gst_util_get_timestamp ();
+    now = gst_util_get_timestamp();
     if (!need_first_frame && now >= deadline) {
       /* In incremental (continuous) mode always emit on deadline.
        * In change-only mode only emit when the server actually sent new pixel
        * data; otherwise advance the deadline and keep polling. */
-      if (src->incremental_update || src->frame_dirty || src->cursor_dirty)
+      if (src->incremental_update || src->frame_dirty || src->cursor_dirty) {
         return TRUE;
+      }
       deadline = now + src->frame_duration;
     }
     if (need_first_frame && now >= timeout_deadline) {
-      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-          "wait-frame", "first-frame-timeout",
+      gst_rfb_src_post_resource_error(
+          src, GST_RESOURCE_ERROR_READ, "wait-frame", "first-frame-timeout",
           "Timed out waiting for first VNC framebuffer update");
       return FALSE;
     }
@@ -1288,11 +1235,12 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
      * request.  Retry every 500 ms so we nudge the server into responding
      * rather than waiting passively until the timeout expires. */
     if (need_first_frame && now >= first_frame_retry_deadline) {
-      GST_DEBUG_OBJECT (src,
-          "no first frame yet, retrying framebuffer update request");
+      GST_DEBUG_OBJECT(
+          src, "no first frame yet, retrying framebuffer update request");
       src->update_request_pending = FALSE;
-      if (!gst_rfb_src_send_framebuffer_update_request (src))
+      if (!gst_rfb_src_send_framebuffer_update_request(src)) {
         return FALSE;
+      }
       first_frame_retry_deadline = now + 500 * GST_MSECOND;
     }
 
@@ -1300,14 +1248,19 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
      * have not yet requested the next update, do so now so we do not stall. */
     if (!need_first_frame && !src->incremental_update &&
         !src->update_request_pending && !src->frame_dirty) {
-      if (!gst_rfb_src_send_framebuffer_update_request (src))
+      if (!gst_rfb_src_send_framebuffer_update_request(src)) {
         return FALSE;
+      }
     }
 
+    /* If the system clock steps backward (NTP adjustment) `remaining` can
+     * underflow as a guint64, producing a huge value. MIN clamps it to 10 ms
+     * so the loop just burns one extra short poll then recovers. */
     remaining = (need_first_frame ? timeout_deadline : deadline) - now;
-    wait_usecs = (guint) MIN (remaining / GST_USECOND, (GstClockTime) 10000);
-    if (wait_usecs == 0)
+    wait_usecs = (guint)MIN(remaining / GST_USECOND, (GstClockTime)10000);
+    if (wait_usecs == 0) {
       wait_usecs = 1;
+    }
 
     /* Release the lock while blocking so that signal handlers (send-pointer,
      * send-key, …) from other threads can send input events to the server.
@@ -1315,46 +1268,48 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
      * always re-acquired before we touch any src fields or call
      * HandleRFBServerMessage. */
     {
-      GstRfbSrc *prev_log = gst_rfb_src_log_ctx_enter (src);
+      GstRfbSrc* prev_log = gst_rfb_src_log_ctx_enter(src);
 
-      g_rec_mutex_unlock (&src->client_lock);
-      ret = WaitForMessage (src->client, wait_usecs);
-      g_rec_mutex_lock (&src->client_lock);
-      gst_rfb_src_log_ctx_leave (prev_log);
+      g_rec_mutex_unlock(&src->client_lock);
+      ret = WaitForMessage(src->client, wait_usecs);
+      g_rec_mutex_lock(&src->client_lock);
+      gst_rfb_src_log_ctx_leave(prev_log);
     }
 
-    if (gst_rfb_src_is_unlocked (src))
+    if (gst_rfb_src_is_unlocked(src)) {
       return FALSE;
+    }
 
     if (ret < 0) {
-      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-          "wait-message",
-          gst_rfb_src_classify_io_failure (src, "server-message-wait-failed"),
+      gst_rfb_src_post_resource_error(
+          src, GST_RESOURCE_ERROR_READ, "wait-message",
+          gst_rfb_src_classify_io_failure(src, "server-message-wait-failed"),
           "Error while waiting for VNC server message");
       return FALSE;
     }
-    g_clear_pointer (&src->last_libvnc_error, g_free);
+    g_clear_pointer(&src->last_libvnc_error, g_free);
 
-    gst_rfb_src_flush_pending_pointer_locked (src);
+    gst_rfb_src_flush_pending_pointer_locked(src);
 
     if (ret > 0) {
-      GstRfbSrc *prev_log = gst_rfb_src_log_ctx_enter (src);
-      rfbBool handled = HandleRFBServerMessage (src->client);
+      GstRfbSrc* prev_log = gst_rfb_src_log_ctx_enter(src);
+      rfbBool handled = HandleRFBServerMessage(src->client);
 
-      gst_rfb_src_log_ctx_leave (prev_log);
+      gst_rfb_src_log_ctx_leave(prev_log);
       if (!handled) {
-        gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-            "handle-message",
-            gst_rfb_src_classify_io_failure (src, "server-message-failed"),
+        gst_rfb_src_post_resource_error(
+            src, GST_RESOURCE_ERROR_READ, "handle-message",
+            gst_rfb_src_classify_io_failure(src, "server-message-failed"),
             "Error while handling VNC server message");
         return FALSE;
       }
-      g_clear_pointer (&src->last_libvnc_error, g_free);
+      g_clear_pointer(&src->last_libvnc_error, g_free);
 
       if (src->geometry_changed) {
         src->geometry_changed = FALSE;
-        if (!gst_rfb_src_update_caps (src))
+        if (!gst_rfb_src_update_caps(src)) {
           return FALSE;
+        }
       }
       need_first_frame = !src->frame_valid;
 
@@ -1363,170 +1318,77 @@ gst_rfb_src_wait_for_frame (GstRfbSrc * src)
        * handlers (send-pointer, send-key) that arrived during that window
        * get an immediate scheduling point rather than waiting another full
        * WaitForMessage cycle. */
-      g_rec_mutex_unlock (&src->client_lock);
-      g_rec_mutex_lock (&src->client_lock);
+      g_rec_mutex_unlock(&src->client_lock);
+      g_rec_mutex_lock(&src->client_lock);
 
-      if (gst_rfb_src_is_unlocked (src))
+      if (gst_rfb_src_is_unlocked(src)) {
         return FALSE;
+      }
 
-      gst_rfb_src_flush_pending_pointer_locked (src);
+      gst_rfb_src_flush_pending_pointer_locked(src);
     }
   }
 }
 
-static gboolean
-gst_rfb_src_cursor_is_usable (GstRfbSrc * src)
-{
-  return src->cursor_client_requested &&
-      src->cursor_shape_valid && src->cursor_position_valid &&
-      src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_NONE;
-}
-
-static void
-gst_rfb_src_maybe_fallback_cursor (GstRfbSrc * src)
-{
-  if (src->cursor_mode != GST_RFB_SRC_CURSOR_MODE_AUTO ||
-      !src->cursor_client_requested ||
-      (src->cursor_shape_valid && src->cursor_position_valid))
-    return;
-
-  src->cursor_auto_fallback_frames++;
-  if (src->cursor_auto_fallback_frames < DEFAULT_CURSOR_FALLBACK_FRAMES)
-    return;
-
-  GST_INFO_OBJECT (src, "no usable remote cursor received; "
-      "falling back to server-drawn cursor");
-
-  gst_rfb_src_clear_cursor (src);
-  src->cursor_client_requested = FALSE;
-  src->client->appData.useRemoteCursor = GST_RFB_FALSE;
-
-  {
-    GstRfbSrc *prev_log = gst_rfb_src_log_ctx_enter (src);
-    rfbBool fmt_ok = SetFormatAndEncodings (src->client);
-
-    gst_rfb_src_log_ctx_leave (prev_log);
-    if (!fmt_ok)
-      GST_WARNING_OBJECT (src,
-          "could not renegotiate server-drawn cursor fallback");
-  }
-}
-
-static void
-gst_rfb_src_draw_cursor (GstRfbSrc * src, GstMapInfo * map,
-    gsize output_stride)
-{
-  gint rel_x, rel_y;
-  gint start_x, start_y, end_x, end_y;
-  gsize src_bpp;
-  gint y;
-
-  if (!gst_rfb_src_cursor_is_usable (src))
-    return;
-
-  if (src->cursor_bpp != 4 && src->cursor_bpp != 3) {
-    GST_LOG_OBJECT (src, "skipping unsupported cursor bpp=%d",
-        src->cursor_bpp);
-    return;
-  }
-
-  rel_x = src->cursor_x - src->cursor_hot_x - src->output_x;
-  rel_y = src->cursor_y - src->cursor_hot_y - src->output_y;
-  start_x = MAX (0, -rel_x);
-  start_y = MAX (0, -rel_y);
-  end_x = MIN (src->cursor_width, src->output_width - rel_x);
-  end_y = MIN (src->cursor_height, src->output_height - rel_y);
-
-  if (start_x >= end_x || start_y >= end_y)
-    return;
-
-  /* Clamp logic above guarantees src and dst offsets stay in bounds. */
-  src_bpp = (gsize) src->cursor_bpp;
-
-  for (y = start_y; y < end_y; y++) {
-    /* Hoist per-row pointers out of the inner loop. */
-    const guint8 *src_px = src->cursor_source
-        + (gsize) y * src->cursor_width * src_bpp
-        + (gsize) start_x * src_bpp;
-    guint8 *dst_px = (guint8 *) map->data
-        + (gsize) (rel_y + y) * output_stride
-        + (gsize) (rel_x + start_x) * 4;
-    /* libvncclient expands the packed RFB 1bpp mask to one byte per pixel. */
-    const guint8 *mask_row = src->cursor_mask
-        ? src->cursor_mask + (gsize) y * src->cursor_width : NULL;
-    gint x;
-
-    for (x = start_x; x < end_x; x++, src_px += src_bpp, dst_px += 4) {
-      if (mask_row && mask_row[x] == 0)
-        continue;
-
-      dst_px[0] = src_px[0];
-      dst_px[1] = src_px[1];
-      dst_px[2] = src_px[2];
-      dst_px[3] = 0xff;
-    }
-  }
-}
-
-static gboolean
-gst_rfb_src_copy_frame (GstRfbSrc * src, GstBuffer * buffer)
+static gboolean gst_rfb_src_copy_frame(GstRfbSrc* src, GstBuffer* buffer)
 {
   GstMapInfo map;
-  const guint8 *source;
+  const guint8* source;
   gsize source_stride;
   gsize output_stride;
   gsize row_bytes;
   gint row;
 
   if (src->client == NULL || src->client->frameBuffer == NULL) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-        "copy-frame", "no-framebuffer", "No VNC framebuffer available");
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_READ, "copy-frame",
+                                    "no-framebuffer",
+                                    "No VNC framebuffer available");
     return FALSE;
   }
 
-  if (!gst_buffer_map (buffer, &map, GST_MAP_WRITE)) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_WRITE,
-        "copy-frame", "output-buffer-map-failed",
-        "Could not map output buffer for writing");
+  if (!gst_buffer_map(buffer, &map, GST_MAP_WRITE)) {
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_WRITE, "copy-frame",
+                                    "output-buffer-map-failed",
+                                    "Could not map output buffer for writing");
     return FALSE;
   }
 
   source = src->client->frameBuffer;
-  source_stride = (gsize) src->client->width * 4;
-  output_stride = GST_VIDEO_INFO_PLANE_STRIDE (&src->vinfo, 0);
-  row_bytes = (gsize) src->output_width * 4;
+  source_stride = (gsize)src->client->width * 4;
+  output_stride = GST_VIDEO_INFO_PLANE_STRIDE(&src->vinfo, 0);
+  row_bytes = (gsize)src->output_width * 4;
 
   for (row = 0; row < src->output_height; row++) {
-    const guint8 *src_row = source +
-        ((gsize) (src->output_y + row) * source_stride) +
-        ((gsize) src->output_x * 4);
-    guint8 *dst_row = map.data + (gsize) row * output_stride;
+    const guint8* src_row = source +
+                            (gsize)(src->offset_y + row) * source_stride +
+                            (gsize)src->offset_x * 4;
+    guint8* dst_row = map.data + (gsize)row * output_stride;
 
-    memcpy (dst_row, src_row, row_bytes);
+    memcpy(dst_row, src_row, row_bytes);
   }
 
-  gst_rfb_src_draw_cursor (src, &map, output_stride);
+  gst_rfb_src_draw_cursor(src, &map, output_stride);
 
-  gst_buffer_unmap (buffer, &map);
+  gst_buffer_unmap(buffer, &map);
   return TRUE;
 }
 
-static GstClockTime
-gst_rfb_src_get_running_time (GstRfbSrc * src)
+static GstClockTime gst_rfb_src_get_running_time(GstRfbSrc* src)
 {
-  GstClock *clock;
+  GstClock* clock;
   GstClockTime now;
   GstClockTime base_time;
 
-  clock = gst_element_get_clock (GST_ELEMENT (src));
+  clock = gst_element_get_clock(GST_ELEMENT(src));
   if (clock) {
-    now = gst_clock_get_time (clock);
-    base_time = gst_element_get_base_time (GST_ELEMENT (src));
-    gst_object_unref (clock);
+    now = gst_clock_get_time(clock);
+    base_time = gst_element_get_base_time(GST_ELEMENT(src));
+    gst_object_unref(clock);
 
-    if (GST_CLOCK_TIME_IS_VALID (now) &&
-        GST_CLOCK_TIME_IS_VALID (base_time) && now >= base_time)
+    if (GST_CLOCK_TIME_IS_VALID(now) && GST_CLOCK_TIME_IS_VALID(base_time) &&
+        now >= base_time) {
       return now - base_time;
+    }
   }
 
   now = src->next_pts;
@@ -1534,53 +1396,96 @@ gst_rfb_src_get_running_time (GstRfbSrc * src)
   return now;
 }
 
-static gboolean
-gst_rfb_src_send_key_locked (GstRfbSrc * src, guint keysym, gboolean down)
+/* =========================================================================
+ * Input: pending pointer, locked send helpers, signal handlers
+ * ========================================================================= */
+
+static void gst_rfb_src_store_pending_pointer(GstRfbSrc* src, gint x, gint y,
+                                              guint button_mask)
+{
+  g_mutex_lock(&src->pending_pointer_lock);
+  src->pending_pointer_x = x;
+  src->pending_pointer_y = y;
+  src->pending_pointer_button_mask = button_mask;
+  src->pending_pointer_valid = TRUE;
+  g_mutex_unlock(&src->pending_pointer_lock);
+}
+
+static gboolean gst_rfb_src_take_pending_pointer(GstRfbSrc* src, gint* x,
+                                                 gint* y, guint* button_mask)
+{
+  gboolean ret;
+
+  g_mutex_lock(&src->pending_pointer_lock);
+  ret = src->pending_pointer_valid;
+  if (ret) {
+    *x = src->pending_pointer_x;
+    *y = src->pending_pointer_y;
+    *button_mask = src->pending_pointer_button_mask;
+    src->pending_pointer_valid = FALSE;
+  }
+  g_mutex_unlock(&src->pending_pointer_lock);
+
+  return ret;
+}
+
+static void gst_rfb_src_clear_pending_pointer(GstRfbSrc* src)
+{
+  g_mutex_lock(&src->pending_pointer_lock);
+  src->pending_pointer_valid = FALSE;
+  g_mutex_unlock(&src->pending_pointer_lock);
+}
+
+/* Requires client_lock held. */
+static gboolean gst_rfb_src_send_key_locked(GstRfbSrc* src, guint keysym,
+                                            gboolean down)
 {
   if (src->view_only) {
-    GST_LOG_OBJECT (src, "dropping key event in view-only mode");
+    GST_LOG_OBJECT(src, "dropping key event in view-only mode");
     return FALSE;
   }
 
   if (!src->connected || src->client == NULL) {
-    GST_WARNING_OBJECT (src, "dropping key event because VNC is not connected");
+    GST_WARNING_OBJECT(src, "dropping key event because VNC is not connected");
     return FALSE;
   }
 
   if (keysym == 0) {
-    GST_WARNING_OBJECT (src, "dropping key event with empty keysym");
+    GST_WARNING_OBJECT(src, "dropping key event with empty keysym");
     return FALSE;
   }
 
-  return SendKeyEvent (src->client, keysym,
-      down ? GST_RFB_TRUE : GST_RFB_FALSE) != 0;
+  return SendKeyEvent(src->client, keysym,
+                      down ? GST_RFB_TRUE : GST_RFB_FALSE) != 0;
 }
 
-static gboolean
-gst_rfb_src_send_pointer_locked (GstRfbSrc * src, gint x, gint y,
-    guint button_mask)
+/* Requires client_lock held. */
+static gboolean gst_rfb_src_send_pointer_locked(GstRfbSrc* src, gint x, gint y,
+                                                guint button_mask)
 {
   gint remote_x;
   gint remote_y;
 
   if (src->view_only) {
-    GST_LOG_OBJECT (src, "dropping pointer event in view-only mode");
+    GST_LOG_OBJECT(src, "dropping pointer event in view-only mode");
     return FALSE;
   }
 
   if (!src->connected || src->client == NULL) {
-    GST_WARNING_OBJECT (src,
-        "dropping pointer event because VNC is not connected");
+    GST_WARNING_OBJECT(src,
+                       "dropping pointer event because VNC is not connected");
     return FALSE;
   }
 
   remote_x = src->offset_x + x;
   remote_y = src->offset_y + y;
 
-  if (src->client->width > 0)
-    remote_x = CLAMP (remote_x, 0, src->client->width - 1);
-  if (src->client->height > 0)
-    remote_y = CLAMP (remote_y, 0, src->client->height - 1);
+  if (src->client->width > 0) {
+    remote_x = CLAMP(remote_x, 0, src->client->width - 1);
+  }
+  if (src->client->height > 0) {
+    remote_y = CLAMP(remote_y, 0, src->client->height - 1);
+  }
 
   src->button_mask = button_mask;
   src->cursor_x = remote_x;
@@ -1589,409 +1494,482 @@ gst_rfb_src_send_pointer_locked (GstRfbSrc * src, gint x, gint y,
   src->frame_dirty = TRUE;
   src->cursor_dirty = TRUE;
 
-  GST_LOG_OBJECT (src, "sending pointer event x=%d y=%d mask=%u",
-      remote_x, remote_y, button_mask);
+  GST_LOG_OBJECT(src, "sending pointer event x=%d y=%d mask=%u", remote_x,
+                 remote_y, button_mask);
 
-  return SendPointerEvent (src->client, remote_x, remote_y, button_mask) != 0;
+  return SendPointerEvent(src->client, remote_x, remote_y, button_mask) != 0;
 }
 
-static void
-gst_rfb_src_flush_pending_pointer_locked (GstRfbSrc * src)
+/* Requires client_lock held.  Drains any motion event coalesced while the
+ * streaming thread was blocked in WaitForMessage. */
+static void gst_rfb_src_flush_pending_pointer_locked(GstRfbSrc* src)
 {
   gint x;
   gint y;
   guint button_mask;
 
-  if (!gst_rfb_src_take_pending_pointer (src, &x, &y, &button_mask))
+  if (!gst_rfb_src_take_pending_pointer(src, &x, &y, &button_mask)) {
     return;
+  }
 
-  if (!gst_rfb_src_send_pointer_locked (src, x, y, button_mask))
-    GST_WARNING_OBJECT (src, "could not send queued pointer event");
+  if (!gst_rfb_src_send_pointer_locked(src, x, y, button_mask)) {
+    GST_WARNING_OBJECT(src, "could not send queued pointer event");
+  }
 }
 
-static gboolean
-gst_rfb_src_signal_send_key (GstRfbSrc * src, guint keysym, gboolean down)
+/* --- Signal handlers -------------------------------------------------------
+ */
+
+static gboolean gst_rfb_src_signal_send_key(GstRfbSrc* src, guint keysym,
+                                            gboolean down)
 {
   gboolean ret;
 
-  g_rec_mutex_lock (&src->client_lock);
-  ret = gst_rfb_src_send_key_locked (src, keysym, down);
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
+  ret = gst_rfb_src_send_key_locked(src, keysym, down);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return ret;
 }
 
-
-static gboolean
-gst_rfb_src_signal_send_dom_key (GstRfbSrc * src, const gchar * key,
-    const gchar * code, gint location, gboolean down)
+static gboolean gst_rfb_src_signal_send_dom_key(GstRfbSrc* src,
+                                                const gchar* key,
+                                                const gchar* code,
+                                                gint location, gboolean down)
 {
   guint keysym;
   gboolean ret;
 
-  GST_DEBUG_OBJECT (src, "dom request keys=%s code=%s location=%d down=%s", key,
-      code, location, down ? "TRUE" : "FALSE");
+  GST_DEBUG_OBJECT(src, "dom request key=%s code=%s location=%d down=%s", key,
+                   code, location, down ? "TRUE" : "FALSE");
 
-  keysym = gst_rfb_src_dom_key_to_keysym (key, location);
+  keysym = rfbsrc_dom_key_to_keysym(key, location);
 
-  g_rec_mutex_lock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
 
   /* On keyup the browser reports the base character (e.g. "q") instead of the
    * modified one (e.g. "@"), so use the keysym recorded at keydown time. */
   if (!down && code != NULL && code[0] != '\0' && src->pressed_keys) {
-    gpointer stored = g_hash_table_lookup (src->pressed_keys, code);
+    gpointer stored = g_hash_table_lookup(src->pressed_keys, code);
     if (stored) {
-      keysym = GPOINTER_TO_UINT (stored);
+      keysym = GPOINTER_TO_UINT(stored);
     }
   }
 
   if (keysym == 0) {
-    g_rec_mutex_unlock (&src->client_lock);
-    GST_DEBUG_OBJECT (src, "no keysym for DOM key='%s' code='%s' location=%d",
-        GST_STR_NULL (key), GST_STR_NULL (code), location);
+    g_rec_mutex_unlock(&src->client_lock);
+    GST_DEBUG_OBJECT(src, "no keysym for DOM key='%s' code='%s' location=%d",
+                     GST_STR_NULL(key), GST_STR_NULL(code), location);
     return FALSE;
   }
 
   /* Windows represents AltGr as LCtrl+RAlt. The browser forwards both, so the
    * VNC server would see Ctrl held when the special character arrives (e.g.
    * Ctrl+@ = NUL instead of @). Release any held Control keys before sending
-   * AltGraph down. */
+   * AltGraph down.
+   *
+   * NOTE: removing the Control entry from pressed_keys means the subsequent
+   * browser keyup for that Control code will not find a stored keysym and will
+   * fall back to computing one directly (XK_Control_L/R) — sending an extra
+   * key-up to the VNC server for a key that is already up. VNC servers treat
+   * duplicate key-up events as a no-op, so this is benign in practice. */
   if (down && keysym == XK_ISO_Level3_Shift && src->pressed_keys) {
-    static const gchar *ctrl_codes[] = { "ControlLeft", "ControlRight", NULL };
+    static const gchar* ctrl_codes[] = {"ControlLeft", "ControlRight", NULL};
     for (gint i = 0; ctrl_codes[i] != NULL; i++) {
-      gpointer stored = g_hash_table_lookup (src->pressed_keys, ctrl_codes[i]);
+      gpointer stored = g_hash_table_lookup(src->pressed_keys, ctrl_codes[i]);
       if (stored) {
-        GST_DEBUG_OBJECT (src, "suppressing Control ('%s') held alongside AltGraph",
-            ctrl_codes[i]);
-        gst_rfb_src_send_key_locked (src, GPOINTER_TO_UINT (stored), FALSE);
-        g_hash_table_remove (src->pressed_keys, ctrl_codes[i]);
+        GST_DEBUG_OBJECT(src,
+                         "suppressing Control ('%s') held alongside AltGraph",
+                         ctrl_codes[i]);
+        gst_rfb_src_send_key_locked(src, GPOINTER_TO_UINT(stored), FALSE);
+        g_hash_table_remove(src->pressed_keys, ctrl_codes[i]);
       }
     }
   }
 
-  ret = gst_rfb_src_send_key_locked (src, keysym, down);
+  ret = gst_rfb_src_send_key_locked(src, keysym, down);
   if (ret && code != NULL && code[0] != '\0' && src->pressed_keys) {
-    if (down)
-      g_hash_table_insert (src->pressed_keys, g_strdup (code),
-          GUINT_TO_POINTER (keysym));
-    else
-      g_hash_table_remove (src->pressed_keys, code);
+    if (down) {
+      g_hash_table_insert(src->pressed_keys, g_strdup(code),
+                          GUINT_TO_POINTER(keysym));
+    }
+    else {
+      g_hash_table_remove(src->pressed_keys, code);
+    }
   }
-  // TODO: Is this unlock needed?
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return ret;
 }
 
-static gboolean
-gst_rfb_src_signal_reset_input (GstRfbSrc * src)
+static gboolean gst_rfb_src_signal_reset_input(GstRfbSrc* src)
 {
   GList *keysyms = NULL, *l;
 
-  g_rec_mutex_lock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
 
-  if (src->pressed_keys && g_hash_table_size (src->pressed_keys) > 0) {
+  if (src->pressed_keys && g_hash_table_size(src->pressed_keys) > 0) {
     GHashTableIter iter;
     gpointer val;
 
-    g_hash_table_iter_init (&iter, src->pressed_keys);
-    while (g_hash_table_iter_next (&iter, NULL, &val))
-      keysyms = g_list_prepend (keysyms, val);
+    g_hash_table_iter_init(&iter, src->pressed_keys);
+    while (g_hash_table_iter_next(&iter, NULL, &val)) {
+      keysyms = g_list_prepend(keysyms, val);
+    }
 
-    g_hash_table_remove_all (src->pressed_keys);
+    g_hash_table_remove_all(src->pressed_keys);
 
-    for (l = keysyms; l != NULL; l = l->next)
-      gst_rfb_src_send_key_locked (src, GPOINTER_TO_UINT (l->data), FALSE);
+    for (l = keysyms; l != NULL; l = l->next) {
+      gst_rfb_src_send_key_locked(src, GPOINTER_TO_UINT(l->data), FALSE);
+    }
 
-    g_list_free (keysyms);
+    g_list_free(keysyms);
   }
 
-  if (src->button_mask != 0)
-    gst_rfb_src_send_pointer_locked (src, src->cursor_x - src->offset_x,
-        src->cursor_y - src->offset_y, 0);
-  gst_rfb_src_clear_pending_pointer (src);
+  if (src->button_mask != 0) {
+    gst_rfb_src_send_pointer_locked(src, src->cursor_x - src->offset_x,
+                                    src->cursor_y - src->offset_y, 0);
+  }
+  gst_rfb_src_clear_pending_pointer(src);
 
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return TRUE;
 }
 
-static gboolean
-gst_rfb_src_signal_send_pointer (GstRfbSrc * src, gint x, gint y,
-    guint button_mask)
+static gboolean gst_rfb_src_signal_send_pointer(GstRfbSrc* src, gint x, gint y,
+                                                guint button_mask)
 {
   gboolean ret;
 
-  if (g_rec_mutex_trylock (&src->client_lock)) {
-    gst_rfb_src_clear_pending_pointer (src);
-    ret = gst_rfb_src_send_pointer_locked (src, x, y, button_mask);
-    g_rec_mutex_unlock (&src->client_lock);
+  if (g_rec_mutex_trylock(&src->client_lock)) {
+    gst_rfb_src_clear_pending_pointer(src);
+    ret = gst_rfb_src_send_pointer_locked(src, x, y, button_mask);
+    g_rec_mutex_unlock(&src->client_lock);
     return ret;
   }
 
   /* Motion without buttons is safe to coalesce; button transitions must keep
    * their order, so those still wait for the client lock. */
   if (button_mask == 0) {
-    gst_rfb_src_store_pending_pointer (src, x, y, button_mask);
-    GST_LOG_OBJECT (src, "queued coalesced pointer event x=%d y=%d", x, y);
+    gst_rfb_src_store_pending_pointer(src, x, y, button_mask);
+    GST_LOG_OBJECT(src, "queued coalesced pointer event x=%d y=%d", x, y);
     return TRUE;
   }
 
-  g_rec_mutex_lock (&src->client_lock);
-  gst_rfb_src_clear_pending_pointer (src);
-  ret = gst_rfb_src_send_pointer_locked (src, x, y, button_mask);
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
+  gst_rfb_src_clear_pending_pointer(src);
+  ret = gst_rfb_src_send_pointer_locked(src, x, y, button_mask);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return ret;
 }
 
-static gboolean
-gst_rfb_src_signal_send_mouse_button (GstRfbSrc * src, gint button,
-    gboolean down, gint x, gint y)
+static gboolean gst_rfb_src_signal_send_mouse_button(GstRfbSrc* src,
+                                                     gint button, gboolean down,
+                                                     gint x, gint y)
 {
   gboolean ret;
   guint mask_bit;
 
   if (button < 1 || button > 8) {
-    GST_WARNING_OBJECT (src, "invalid mouse button %d", button);
+    GST_WARNING_OBJECT(src, "invalid mouse button %d", button);
     return FALSE;
   }
 
   mask_bit = 1u << (button - 1);
 
-  g_rec_mutex_lock (&src->client_lock);
-  gst_rfb_src_clear_pending_pointer (src);
-  if (down)
+  g_rec_mutex_lock(&src->client_lock);
+  gst_rfb_src_clear_pending_pointer(src);
+  if (down) {
     src->button_mask |= mask_bit;
-  else
+  }
+  else {
     src->button_mask &= ~mask_bit;
+  }
 
-  ret = gst_rfb_src_send_pointer_locked (src, x, y, src->button_mask);
-  g_rec_mutex_unlock (&src->client_lock);
+  ret = gst_rfb_src_send_pointer_locked(src, x, y, src->button_mask);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return ret;
 }
 
-static gboolean
-gst_rfb_src_signal_send_text (GstRfbSrc * src, const gchar * text)
+static gboolean gst_rfb_src_signal_send_text(GstRfbSrc* src, const gchar* text)
 {
-  const gchar *p;
+  const gchar* p;
   gboolean ret = TRUE;
 
-  if (text == NULL)
+  if (text == NULL) {
     return FALSE;
+  }
 
-  g_rec_mutex_lock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
 
-  for (p = text; *p != '\0'; p = g_utf8_next_char (p)) {
+  for (p = text; *p != '\0'; p = g_utf8_next_char(p)) {
     gunichar ch;
     guint keysym;
 
-    ch = g_utf8_get_char_validated (p, -1);
-    if (ch == (gunichar) - 1 || ch == (gunichar) - 2) {
+    ch = g_utf8_get_char_validated(p, -1);
+    if (ch == (gunichar)-1 || ch == (gunichar)-2) {
+      GST_WARNING_OBJECT(
+          src, "send-text: invalid UTF-8 at byte offset %" G_GSIZE_FORMAT,
+          (gsize)(p - text));
       ret = FALSE;
       break;
     }
 
-    keysym = gst_rfb_src_unicode_to_keysym (ch);
-    ret = gst_rfb_src_send_key_locked (src, keysym, TRUE) &&
-        gst_rfb_src_send_key_locked (src, keysym, FALSE);
-    if (!ret)
+    keysym = rfbsrc_unicode_to_keysym(ch);
+    ret = gst_rfb_src_send_key_locked(src, keysym, TRUE) &&
+          gst_rfb_src_send_key_locked(src, keysym, FALSE);
+    if (!ret) {
       break;
+    }
   }
 
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return ret;
 }
 
-static gboolean
-gst_rfb_src_signal_send_clipboard (GstRfbSrc * src, const gchar * text)
+static gboolean gst_rfb_src_signal_send_clipboard(GstRfbSrc* src,
+                                                  const gchar* text)
 {
   gboolean ret;
-  gchar *latin1 = NULL;
+  gchar* latin1 = NULL;
   gsize bytes_written = 0;
-  GError *error = NULL;
+  GError* error = NULL;
 
-  if (text == NULL)
+  if (text == NULL) {
     return FALSE;
+  }
 
-  g_rec_mutex_lock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
 
   if (src->view_only) {
     ret = FALSE;
-  } else if (!src->connected || src->client == NULL) {
-    GST_WARNING_OBJECT (src,
-        "dropping clipboard event because VNC is not connected");
+  }
+  else if (!src->connected || src->client == NULL) {
+    GST_WARNING_OBJECT(src,
+                       "dropping clipboard event because VNC is not connected");
     ret = FALSE;
-  } else {
+  }
+  else {
     /* Older LibVNCClient only exposes SendClientCutText(), whose payload is
      * Latin-1. Keep the plugin linkable there and degrade non-Latin-1 chars. */
-    latin1 = g_convert_with_fallback (text, -1, "ISO-8859-1", "UTF-8", "?",
-        NULL, &bytes_written, &error);
+    latin1 = g_convert_with_fallback(text, -1, "ISO-8859-1", "UTF-8", "?", NULL,
+                                     &bytes_written, &error);
     if (latin1 == NULL) {
-      GST_WARNING_OBJECT (src, "could not convert clipboard text: %s",
-          error->message);
-      g_clear_error (&error);
+      GST_WARNING_OBJECT(src, "could not convert clipboard text: %s",
+                         error->message);
+      g_clear_error(&error);
       ret = FALSE;
-    } else {
-      ret = SendClientCutText (src->client, latin1, (int) bytes_written) != 0;
-      g_free (latin1);
+    }
+    else {
+      ret = SendClientCutText(src->client, latin1, (int)bytes_written) != 0;
+      g_free(latin1);
     }
   }
 
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return ret;
 }
 
-static void
-gst_rfb_src_class_init (GstRfbSrcClass * klass)
+/* =========================================================================
+ * GStreamer element: type, pad template, class and instance init
+ * ========================================================================= */
+
+static GType gst_rfb_src_cursor_mode_get_type(void)
 {
-  GObjectClass *gobject_class;
-  GstBaseSrcClass *gstbasesrc_class;
-  GstElementClass *gstelement_class;
-  GstPushSrcClass *gstpushsrc_class;
+  static gsize type_id = 0;
+
+  if (g_once_init_enter(&type_id)) {
+    static const GEnumValue values[] = {
+        {GST_RFB_SRC_CURSOR_MODE_AUTO, "Auto", "auto"},
+        {GST_RFB_SRC_CURSOR_MODE_CLIENT, "Client-side", "client"},
+        {GST_RFB_SRC_CURSOR_MODE_SERVER, "Server-side", "server"},
+        {GST_RFB_SRC_CURSOR_MODE_NONE, "None", "none"},
+        {0, NULL, NULL}};
+    GType tmp = g_enum_register_static("GstRfbSrcCursorMode", values);
+
+    g_once_init_leave(&type_id, tmp);
+  }
+
+  return type_id;
+}
+
+#define GST_TYPE_RFB_SRC_CURSOR_MODE (gst_rfb_src_cursor_mode_get_type())
+
+static GstStaticPadTemplate gst_rfb_src_template =
+    GST_STATIC_PAD_TEMPLATE("src", GST_PAD_SRC, GST_PAD_ALWAYS,
+                            GST_STATIC_CAPS(GST_VIDEO_CAPS_MAKE("BGRx")));
+
+static void gst_rfb_src_class_init(GstRfbSrcClass* klass)
+{
+  GObjectClass* gobject_class = (GObjectClass*)klass;
+  GstBaseSrcClass* gstbasesrc_class = (GstBaseSrcClass*)klass;
+  GstPushSrcClass* gstpushsrc_class = (GstPushSrcClass*)klass;
+  GstElementClass* gstelement_class = GST_ELEMENT_CLASS(klass);
   GParamFlags ready_flags;
 
-  GST_DEBUG_CATEGORY_INIT (rfbsrc_debug, "rfbsrc", 0,
-      "LibVNCClient-backed RFB source");
-  gst_rfb_src_install_libvnc_logging ();
-
-  gobject_class = (GObjectClass *) klass;
-  gstbasesrc_class = (GstBaseSrcClass *) klass;
-  gstpushsrc_class = (GstPushSrcClass *) klass;
-  gstelement_class = GST_ELEMENT_CLASS (klass);
+  GST_DEBUG_CATEGORY_INIT(rfbsrc_debug, "rfbsrc", 0,
+                          "LibVNCClient-backed RFB source");
+  gst_rfb_src_install_libvnc_logging();
 
   gobject_class->finalize = gst_rfb_src_finalize;
   gobject_class->set_property = gst_rfb_src_set_property;
   gobject_class->get_property = gst_rfb_src_get_property;
 
-  gstbasesrc_class->start = GST_DEBUG_FUNCPTR (gst_rfb_src_start);
-  gstbasesrc_class->stop = GST_DEBUG_FUNCPTR (gst_rfb_src_stop);
-  gstbasesrc_class->negotiate = GST_DEBUG_FUNCPTR (gst_rfb_src_negotiate);
-  gstbasesrc_class->unlock = GST_DEBUG_FUNCPTR (gst_rfb_src_unlock);
-  gstbasesrc_class->unlock_stop = GST_DEBUG_FUNCPTR (gst_rfb_src_unlock_stop);
-  gstpushsrc_class->create = GST_DEBUG_FUNCPTR (gst_rfb_src_create);
+  gstbasesrc_class->start = GST_DEBUG_FUNCPTR(gst_rfb_src_start);
+  gstbasesrc_class->stop = GST_DEBUG_FUNCPTR(gst_rfb_src_stop);
+  gstbasesrc_class->negotiate = GST_DEBUG_FUNCPTR(gst_rfb_src_negotiate);
+  gstbasesrc_class->unlock = GST_DEBUG_FUNCPTR(gst_rfb_src_unlock);
+  gstbasesrc_class->unlock_stop = GST_DEBUG_FUNCPTR(gst_rfb_src_unlock_stop);
+  gstpushsrc_class->create = GST_DEBUG_FUNCPTR(gst_rfb_src_create);
 
-  gst_element_class_add_static_pad_template (gstelement_class,
-      &gst_rfb_src_template);
+  gst_element_class_add_static_pad_template(gstelement_class,
+                                            &gst_rfb_src_template);
 
-  gst_element_class_set_static_metadata (gstelement_class,
-      "RFB/VNC source", "Source/Video",
+  gst_element_class_set_static_metadata(
+      gstelement_class, "RFB/VNC source", "Source/Video",
       "Creates a raw video stream from a VNC server using LibVNCClient",
       "David A. Schleef <ds@schleef.org>, "
       "Andre Moreira Magalhaes <andre.magalhaes@indt.org.br>, "
       "Thijs Vermeir <thijsvermeir@gmail.com>, Autonoma");
 
-  ready_flags = G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
-      GST_PARAM_MUTABLE_READY;
+  ready_flags =
+      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY;
+
+  /* --- Properties --- */
 
   /**
    * GstRfbSrc:uri:
    *
    * URI in the form rfb://[user:password@]host[:port]?property=value.
    */
-  g_object_class_install_property (gobject_class, PROP_URI,
-      g_param_spec_string ("uri", "URI",
+  g_object_class_install_property(
+      gobject_class, PROP_URI,
+      g_param_spec_string(
+          "uri", "URI",
           "URI in the form rfb://[user:password@]host[:port]?property=value",
           DEFAULT_PROP_URI, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_HOST,
-      g_param_spec_string ("host", "Host", "Host to connect to",
-          DEFAULT_PROP_HOST, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_HOST,
+      g_param_spec_string("host", "Host", "Host to connect to",
+                          DEFAULT_PROP_HOST, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_PORT,
-      g_param_spec_int ("port", "Port", "Port to connect to",
-          1, 65535, DEFAULT_PROP_PORT, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_PORT,
+      g_param_spec_int("port", "Port", "Port to connect to", 1, 65535,
+                       DEFAULT_PROP_PORT, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_USERNAME,
-      g_param_spec_string ("username", "Username",
-          "Username for VNC security types that require one", NULL,
-          ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_USERNAME,
+      g_param_spec_string("username", "Username",
+                          "Username for VNC security types that require one",
+                          NULL, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_VERSION,
-      g_param_spec_string ("version", "RFB protocol version",
-          "Requested RFB protocol version (kept for compatibility; "
-          "LibVNCClient negotiates automatically)", DEFAULT_PROP_VERSION,
-          ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_PASSWORD,
+      g_param_spec_string(
+          "password", "Password", "Password for VNC authentication", NULL,
+          G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS | GST_PARAM_MUTABLE_READY));
 
-  g_object_class_install_property (gobject_class, PROP_PASSWORD,
-      g_param_spec_string ("password", "Password",
-          "Password for VNC authentication", NULL,
-          G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS |
-          GST_PARAM_MUTABLE_READY));
+  g_object_class_install_property(
+      gobject_class, PROP_OFFSET_X,
+      g_param_spec_int("offset-x", "X offset",
+                       "Left offset of the capture rectangle", 0, G_MAXINT, 0,
+                       ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_OFFSET_X,
-      g_param_spec_int ("offset-x", "X offset",
-          "Left offset of the capture rectangle", 0, G_MAXINT, 0,
-          ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_OFFSET_Y,
+      g_param_spec_int("offset-y", "Y offset",
+                       "Top offset of the capture rectangle", 0, G_MAXINT, 0,
+                       ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_OFFSET_Y,
-      g_param_spec_int ("offset-y", "Y offset",
-          "Top offset of the capture rectangle", 0, G_MAXINT, 0,
-          ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_WIDTH,
+      g_param_spec_int(
+          "width", "Width",
+          "Capture rectangle width, or 0 for remaining desktop width", 0,
+          G_MAXINT, 0, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_WIDTH,
-      g_param_spec_int ("width", "Width",
-          "Capture rectangle width, or 0 for remaining desktop width",
-          0, G_MAXINT, 0, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_HEIGHT,
+      g_param_spec_int(
+          "height", "Height",
+          "Capture rectangle height, or 0 for remaining desktop height", 0,
+          G_MAXINT, 0, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_HEIGHT,
-      g_param_spec_int ("height", "Height",
-          "Capture rectangle height, or 0 for remaining desktop height",
-          0, G_MAXINT, 0, ready_flags));
-
-  g_object_class_install_property (gobject_class, PROP_INCREMENTAL,
-      g_param_spec_boolean ("incremental", "Incremental updates",
+  g_object_class_install_property(
+      gobject_class, PROP_INCREMENTAL,
+      g_param_spec_boolean(
+          "incremental", "Incremental updates",
           "When TRUE (default), emit output frames at max-framerate regardless "
           "of whether the remote screen changed.  When FALSE, suppress output "
-          "frames when the server reports no pixel changes since the last frame.",
+          "frames when the server reports no pixel changes since the last "
+          "frame.",
           TRUE, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_USE_COPYRECT,
-      g_param_spec_boolean ("use-copyrect", "Use CopyRect",
-          "Include CopyRect in requested encodings", FALSE, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_USE_COPYRECT,
+      g_param_spec_boolean("use-copyrect", "Use CopyRect",
+                           "Include CopyRect in requested encodings", FALSE,
+                           ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_ENCODINGS,
-      g_param_spec_string ("encodings", "Encodings",
-          "LibVNCClient encoding preference string",
-          DEFAULT_PROP_ENCODINGS, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_ENCODINGS,
+      g_param_spec_string("encodings", "Encodings",
+                          "LibVNCClient encoding preference string",
+                          DEFAULT_PROP_ENCODINGS, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_SHARED,
-      g_param_spec_boolean ("shared", "Shared desktop",
-          "Share desktop with other VNC clients", TRUE, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_SHARED,
+      g_param_spec_boolean("shared", "Shared desktop",
+                           "Share desktop with other VNC clients", TRUE,
+                           ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_VIEWONLY,
-      g_param_spec_boolean ("view-only", "View only",
+  g_object_class_install_property(
+      gobject_class, PROP_VIEWONLY,
+      g_param_spec_boolean(
+          "view-only", "View only",
           "Disable sending keyboard, pointer, and clipboard events", FALSE,
           ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_CURSOR_MODE,
-      g_param_spec_enum ("cursor-mode", "Cursor mode",
+  g_object_class_install_property(
+      gobject_class, PROP_CURSOR_MODE,
+      g_param_spec_enum(
+          "cursor-mode", "Cursor mode",
           "How to include the remote mouse cursor in output frames",
-          GST_TYPE_RFB_SRC_CURSOR_MODE, DEFAULT_PROP_CURSOR_MODE,
-          ready_flags));
+          GST_TYPE_RFB_SRC_CURSOR_MODE, DEFAULT_PROP_CURSOR_MODE, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_MAX_FRAMERATE,
-      g_param_spec_int ("max-framerate", "Maximum framerate",
-          "Maximum output frames per second", 1, 240,
-          DEFAULT_PROP_MAX_FRAMERATE, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_MAX_FRAMERATE,
+      g_param_spec_int("max-framerate", "Maximum framerate",
+                       "Maximum output frames per second", 1, 240,
+                       DEFAULT_PROP_MAX_FRAMERATE, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_FRAME_TIMEOUT_MS,
-      g_param_spec_uint ("frame-timeout-ms", "Frame timeout",
-          "Maximum time to wait for the first framebuffer update in ms",
-          1, 60000, DEFAULT_PROP_FRAME_TIMEOUT_MS, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_FRAME_TIMEOUT_MS,
+      g_param_spec_uint(
+          "frame-timeout-ms", "Frame timeout",
+          "Maximum time to wait for the first framebuffer update in ms", 1,
+          60000, DEFAULT_PROP_FRAME_TIMEOUT_MS, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_CONNECT_TIMEOUT,
-      g_param_spec_uint ("connect-timeout", "Connect timeout",
-          "Socket connect timeout in seconds", 1, 3600,
-          DEFAULT_PROP_CONNECT_TIMEOUT, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_CONNECT_TIMEOUT,
+      g_param_spec_uint("connect-timeout", "Connect timeout",
+                        "Socket connect timeout in seconds", 1, 3600,
+                        DEFAULT_PROP_CONNECT_TIMEOUT, ready_flags));
 
-  g_object_class_install_property (gobject_class, PROP_READ_TIMEOUT,
-      g_param_spec_uint ("read-timeout", "Read timeout",
-          "Socket read timeout in seconds", 0, 3600,
-          DEFAULT_PROP_READ_TIMEOUT, ready_flags));
+  g_object_class_install_property(
+      gobject_class, PROP_READ_TIMEOUT,
+      g_param_spec_uint("read-timeout", "Read timeout",
+                        "Socket read timeout in seconds", 0, 3600,
+                        DEFAULT_PROP_READ_TIMEOUT, ready_flags));
+
+  /* --- Signals --- */
 
   /**
    * GstRfbSrc::send-key:
@@ -2003,18 +1981,18 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
    *
    * Returns: %TRUE when the event was sent.
    */
-  gst_rfb_src_signals[SIGNAL_SEND_KEY] =
-      g_signal_new_class_handler ("send-key", G_TYPE_FROM_CLASS (klass),
-      G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-      G_CALLBACK (gst_rfb_src_signal_send_key), NULL, NULL, NULL,
-      G_TYPE_BOOLEAN, 2, G_TYPE_UINT, G_TYPE_BOOLEAN);
+  gst_rfb_src_signals[SIGNAL_SEND_KEY] = g_signal_new_class_handler(
+      "send-key", G_TYPE_FROM_CLASS(klass), G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+      G_CALLBACK(gst_rfb_src_signal_send_key), NULL, NULL, NULL, G_TYPE_BOOLEAN,
+      2, G_TYPE_UINT, G_TYPE_BOOLEAN);
 
   /**
    * GstRfbSrc::send-dom-key:
    * @object: the #GstRfbSrc
    * @key: DOM KeyboardEvent.key value (e.g. "a", "Enter", "Shift", "ArrowLeft")
    * @code: DOM KeyboardEvent.code value (e.g. "KeyA", "Enter", "ShiftLeft")
-   * @location: DOM KeyboardEvent.location (0=standard, 1=left, 2=right, 3=numpad)
+   * @location: DOM KeyboardEvent.location (0=standard, 1=left, 2=right,
+   * 3=numpad)
    * @down: %TRUE for key press, %FALSE for key release
    *
    * Send a DOM keyboard event to the VNC server. The plugin maps DOM key
@@ -2022,10 +2000,10 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
    *
    * Returns: %TRUE when the event was sent.
    */
-  gst_rfb_src_signals[SIGNAL_SEND_DOM_KEY] =
-      g_signal_new_class_handler ("send-dom-key", G_TYPE_FROM_CLASS (klass),
+  gst_rfb_src_signals[SIGNAL_SEND_DOM_KEY] = g_signal_new_class_handler(
+      "send-dom-key", G_TYPE_FROM_CLASS(klass),
       G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-      G_CALLBACK (gst_rfb_src_signal_send_dom_key), NULL, NULL, NULL,
+      G_CALLBACK(gst_rfb_src_signal_send_dom_key), NULL, NULL, NULL,
       G_TYPE_BOOLEAN, 4, G_TYPE_STRING, G_TYPE_STRING, G_TYPE_INT,
       G_TYPE_BOOLEAN);
 
@@ -2040,10 +2018,10 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
    *
    * Returns: %TRUE when the event was sent or queued for coalesced sending.
    */
-  gst_rfb_src_signals[SIGNAL_SEND_POINTER] =
-      g_signal_new_class_handler ("send-pointer", G_TYPE_FROM_CLASS (klass),
+  gst_rfb_src_signals[SIGNAL_SEND_POINTER] = g_signal_new_class_handler(
+      "send-pointer", G_TYPE_FROM_CLASS(klass),
       G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-      G_CALLBACK (gst_rfb_src_signal_send_pointer), NULL, NULL, NULL,
+      G_CALLBACK(gst_rfb_src_signal_send_pointer), NULL, NULL, NULL,
       G_TYPE_BOOLEAN, 3, G_TYPE_INT, G_TYPE_INT, G_TYPE_UINT);
 
   /**
@@ -2058,10 +2036,10 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
    *
    * Returns: %TRUE when the event was sent.
    */
-  gst_rfb_src_signals[SIGNAL_SEND_MOUSE_BUTTON] =
-      g_signal_new_class_handler ("send-mouse-button",
-      G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-      G_CALLBACK (gst_rfb_src_signal_send_mouse_button), NULL, NULL, NULL,
+  gst_rfb_src_signals[SIGNAL_SEND_MOUSE_BUTTON] = g_signal_new_class_handler(
+      "send-mouse-button", G_TYPE_FROM_CLASS(klass),
+      G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+      G_CALLBACK(gst_rfb_src_signal_send_mouse_button), NULL, NULL, NULL,
       G_TYPE_BOOLEAN, 4, G_TYPE_INT, G_TYPE_BOOLEAN, G_TYPE_INT, G_TYPE_INT);
 
   /**
@@ -2074,10 +2052,10 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
    * Returns: %TRUE when all key events were sent.
    */
   gst_rfb_src_signals[SIGNAL_SEND_TEXT] =
-      g_signal_new_class_handler ("send-text", G_TYPE_FROM_CLASS (klass),
-      G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-      G_CALLBACK (gst_rfb_src_signal_send_text), NULL, NULL, NULL,
-      G_TYPE_BOOLEAN, 1, G_TYPE_STRING);
+      g_signal_new_class_handler("send-text", G_TYPE_FROM_CLASS(klass),
+                                 G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+                                 G_CALLBACK(gst_rfb_src_signal_send_text), NULL,
+                                 NULL, NULL, G_TYPE_BOOLEAN, 1, G_TYPE_STRING);
 
   /**
    * GstRfbSrc::send-clipboard:
@@ -2088,10 +2066,10 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
    *
    * Returns: %TRUE when the clipboard message was sent.
    */
-  gst_rfb_src_signals[SIGNAL_SEND_CLIPBOARD] =
-      g_signal_new_class_handler ("send-clipboard", G_TYPE_FROM_CLASS (klass),
+  gst_rfb_src_signals[SIGNAL_SEND_CLIPBOARD] = g_signal_new_class_handler(
+      "send-clipboard", G_TYPE_FROM_CLASS(klass),
       G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-      G_CALLBACK (gst_rfb_src_signal_send_clipboard), NULL, NULL, NULL,
+      G_CALLBACK(gst_rfb_src_signal_send_clipboard), NULL, NULL, NULL,
       G_TYPE_BOOLEAN, 1, G_TYPE_STRING);
 
   /**
@@ -2105,26 +2083,24 @@ gst_rfb_src_class_init (GstRfbSrcClass * klass)
    * Returns: %TRUE when the reset was performed.
    */
   gst_rfb_src_signals[SIGNAL_RESET_INPUT] =
-      g_signal_new_class_handler ("reset-input", G_TYPE_FROM_CLASS (klass),
-      G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
-      G_CALLBACK (gst_rfb_src_signal_reset_input), NULL, NULL, NULL,
-      G_TYPE_BOOLEAN, 0);
+      g_signal_new_class_handler("reset-input", G_TYPE_FROM_CLASS(klass),
+                                 G_SIGNAL_RUN_LAST | G_SIGNAL_ACTION,
+                                 G_CALLBACK(gst_rfb_src_signal_reset_input),
+                                 NULL, NULL, NULL, G_TYPE_BOOLEAN, 0);
 }
 
-static void
-gst_rfb_src_init (GstRfbSrc * src)
+static void gst_rfb_src_init(GstRfbSrc* src)
 {
-  GstBaseSrc *bsrc = GST_BASE_SRC (src);
+  GstBaseSrc* bsrc = GST_BASE_SRC(src);
 
-  gst_pad_use_fixed_caps (GST_BASE_SRC_PAD (bsrc));
-  gst_base_src_set_live (bsrc, TRUE);
-  gst_base_src_set_format (bsrc, GST_FORMAT_TIME);
+  gst_pad_use_fixed_caps(GST_BASE_SRC_PAD(bsrc));
+  gst_base_src_set_live(bsrc, TRUE);
+  gst_base_src_set_format(bsrc, GST_FORMAT_TIME);
 
-  src->uri = gst_uri_from_string (DEFAULT_PROP_URI);
-  src->host = g_strdup (DEFAULT_PROP_HOST);
+  src->uri = gst_uri_from_string(DEFAULT_PROP_URI);
+  src->host = g_strdup(DEFAULT_PROP_HOST);
   src->port = DEFAULT_PROP_PORT;
-  src->version = g_strdup (DEFAULT_PROP_VERSION);
-  src->encodings = g_strdup (DEFAULT_PROP_ENCODINGS);
+  src->encodings = g_strdup(DEFAULT_PROP_ENCODINGS);
   src->incremental_update = TRUE;
   src->shared = TRUE;
   src->view_only = FALSE;
@@ -2135,221 +2111,233 @@ gst_rfb_src_init (GstRfbSrc * src)
   src->connect_timeout = DEFAULT_PROP_CONNECT_TIMEOUT;
   src->read_timeout = DEFAULT_PROP_READ_TIMEOUT;
   src->frame_duration =
-      gst_util_uint64_scale_int (GST_SECOND, 1, src->max_framerate);
+      gst_util_uint64_scale_int(GST_SECOND, 1, src->max_framerate);
   src->last_frame_time = GST_CLOCK_TIME_NONE;
 
-  src->pressed_keys = g_hash_table_new_full (g_str_hash, g_str_equal,
-      g_free, NULL);
+  src->pressed_keys =
+      g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 
-  gst_video_info_init (&src->vinfo);
-  g_rec_mutex_init (&src->client_lock);
-  g_mutex_init (&src->pending_pointer_lock);
+  gst_video_info_init(&src->vinfo);
+  g_rec_mutex_init(&src->client_lock);
+  g_mutex_init(&src->pending_pointer_lock);
 }
 
-static void
-gst_rfb_src_finalize (GObject * object)
+static void gst_rfb_src_finalize(GObject* object)
 {
-  GstRfbSrc *src = GST_RFB_SRC (object);
+  GstRfbSrc* src = GST_RFB_SRC(object);
 
-  g_rec_mutex_lock (&src->client_lock);
-  gst_rfb_src_close (src);
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
+  gst_rfb_src_close(src);
+  g_rec_mutex_unlock(&src->client_lock);
 
-  if (src->uri)
-    gst_uri_unref (src->uri);
+  if (src->uri) {
+    gst_uri_unref(src->uri);
+  }
 
-  g_free (src->host);
-  g_free (src->username);
-  g_free (src->password);
-  g_free (src->version);
-  g_free (src->encodings);
-  g_free (src->active_encodings);
-  g_free (src->last_libvnc_error);
-  g_clear_pointer (&src->pressed_keys, g_hash_table_unref);
-  g_rec_mutex_clear (&src->client_lock);
-  g_mutex_clear (&src->pending_pointer_lock);
+  g_free(src->host);
+  g_free(src->username);
+  g_free(src->password);
+  g_free(src->encodings);
+  g_free(src->active_encodings);
+  g_free(src->last_libvnc_error);
+  g_clear_pointer(&src->pressed_keys, g_hash_table_unref);
+  g_rec_mutex_clear(&src->client_lock);
+  g_mutex_clear(&src->pending_pointer_lock);
 
-  G_OBJECT_CLASS (parent_class)->finalize (object);
+  G_OBJECT_CLASS(parent_class)->finalize(object);
 }
 
-static void
-gst_rfb_src_set_property (GObject * object, guint prop_id,
-    const GValue * value, GParamSpec * pspec)
+/* =========================================================================
+ * GStreamer element: property accessors
+ * ========================================================================= */
+
+static void gst_rfb_src_set_property(GObject* object, guint prop_id,
+                                     const GValue* value, GParamSpec* pspec)
 {
-  GstRfbSrc *src = GST_RFB_SRC (object);
+  GstRfbSrc* src = GST_RFB_SRC(object);
 
   switch (prop_id) {
     case PROP_URI:
-      gst_rfb_src_uri_set_uri ((GstURIHandler *) src,
-          g_value_get_string (value), NULL);
+      gst_rfb_src_uri_set_uri((GstURIHandler*)src, g_value_get_string(value),
+                              NULL);
       break;
     case PROP_HOST:
-      gst_rfb_src_set_ready_string (src, &src->host,
-          g_value_get_string (value), "host");
+      gst_rfb_src_set_ready_string(src, &src->host, g_value_get_string(value),
+                                   "host");
       break;
     case PROP_PORT:
-      if (gst_rfb_src_check_ready (src, "port"))
-        src->port = g_value_get_int (value);
+      if (gst_rfb_src_check_ready(src, "port")) {
+        src->port = g_value_get_int(value);
+      }
       break;
     case PROP_USERNAME:
-      gst_rfb_src_set_ready_string (src, &src->username,
-          g_value_get_string (value), "username");
-      break;
-    case PROP_VERSION:
-      gst_rfb_src_set_ready_string (src, &src->version,
-          g_value_get_string (value), "version");
+      gst_rfb_src_set_ready_string(src, &src->username,
+                                   g_value_get_string(value), "username");
       break;
     case PROP_PASSWORD:
-      gst_rfb_src_set_ready_string (src, &src->password,
-          g_value_get_string (value), "password");
+      gst_rfb_src_set_ready_string(src, &src->password,
+                                   g_value_get_string(value), "password");
       break;
     case PROP_OFFSET_X:
-      if (gst_rfb_src_check_ready (src, "offset-x"))
-        src->offset_x = g_value_get_int (value);
+      if (gst_rfb_src_check_ready(src, "offset-x")) {
+        src->offset_x = g_value_get_int(value);
+      }
       break;
     case PROP_OFFSET_Y:
-      if (gst_rfb_src_check_ready (src, "offset-y"))
-        src->offset_y = g_value_get_int (value);
+      if (gst_rfb_src_check_ready(src, "offset-y")) {
+        src->offset_y = g_value_get_int(value);
+      }
       break;
     case PROP_WIDTH:
-      if (gst_rfb_src_check_ready (src, "width"))
-        src->requested_width = g_value_get_int (value);
+      if (gst_rfb_src_check_ready(src, "width")) {
+        src->requested_width = g_value_get_int(value);
+      }
       break;
     case PROP_HEIGHT:
-      if (gst_rfb_src_check_ready (src, "height"))
-        src->requested_height = g_value_get_int (value);
+      if (gst_rfb_src_check_ready(src, "height")) {
+        src->requested_height = g_value_get_int(value);
+      }
       break;
     case PROP_INCREMENTAL:
-      if (gst_rfb_src_check_ready (src, "incremental"))
-        src->incremental_update = g_value_get_boolean (value);
+      if (gst_rfb_src_check_ready(src, "incremental")) {
+        src->incremental_update = g_value_get_boolean(value);
+      }
       break;
     case PROP_USE_COPYRECT:
-      if (gst_rfb_src_check_ready (src, "use-copyrect"))
-        src->use_copyrect = g_value_get_boolean (value);
+      if (gst_rfb_src_check_ready(src, "use-copyrect")) {
+        src->use_copyrect = g_value_get_boolean(value);
+      }
       break;
     case PROP_ENCODINGS:
-      gst_rfb_src_set_ready_string (src, &src->encodings,
-          g_value_get_string (value), "encodings");
+      gst_rfb_src_set_ready_string(src, &src->encodings,
+                                   g_value_get_string(value), "encodings");
       break;
     case PROP_SHARED:
-      if (gst_rfb_src_check_ready (src, "shared"))
-        src->shared = g_value_get_boolean (value);
+      if (gst_rfb_src_check_ready(src, "shared")) {
+        src->shared = g_value_get_boolean(value);
+      }
       break;
     case PROP_VIEWONLY:
-      if (gst_rfb_src_check_ready (src, "view-only"))
-        src->view_only = g_value_get_boolean (value);
+      if (gst_rfb_src_check_ready(src, "view-only")) {
+        src->view_only = g_value_get_boolean(value);
+      }
       break;
     case PROP_CURSOR_MODE:
-      if (gst_rfb_src_check_ready (src, "cursor-mode"))
-        src->cursor_mode = g_value_get_enum (value);
+      if (gst_rfb_src_check_ready(src, "cursor-mode")) {
+        src->cursor_mode = g_value_get_enum(value);
+      }
       break;
     case PROP_MAX_FRAMERATE:
-      if (gst_rfb_src_check_ready (src, "max-framerate")) {
-        src->max_framerate = g_value_get_int (value);
+      if (gst_rfb_src_check_ready(src, "max-framerate")) {
+        src->max_framerate = g_value_get_int(value);
         src->frame_duration =
-            gst_util_uint64_scale_int (GST_SECOND, 1, src->max_framerate);
+            gst_util_uint64_scale_int(GST_SECOND, 1, src->max_framerate);
       }
       break;
     case PROP_FRAME_TIMEOUT_MS:
-      if (gst_rfb_src_check_ready (src, "frame-timeout-ms"))
-        src->frame_timeout_ms = g_value_get_uint (value);
+      if (gst_rfb_src_check_ready(src, "frame-timeout-ms")) {
+        src->frame_timeout_ms = g_value_get_uint(value);
+      }
       break;
     case PROP_CONNECT_TIMEOUT:
-      if (gst_rfb_src_check_ready (src, "connect-timeout"))
-        src->connect_timeout = g_value_get_uint (value);
+      if (gst_rfb_src_check_ready(src, "connect-timeout")) {
+        src->connect_timeout = g_value_get_uint(value);
+      }
       break;
     case PROP_READ_TIMEOUT:
-      if (gst_rfb_src_check_ready (src, "read-timeout"))
-        src->read_timeout = g_value_get_uint (value);
+      if (gst_rfb_src_check_ready(src, "read-timeout")) {
+        src->read_timeout = g_value_get_uint(value);
+      }
       break;
     default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
   }
 }
 
-static void
-gst_rfb_src_get_property (GObject * object, guint prop_id,
-    GValue * value, GParamSpec * pspec)
+static void gst_rfb_src_get_property(GObject* object, guint prop_id,
+                                     GValue* value, GParamSpec* pspec)
 {
-  GstRfbSrc *src = GST_RFB_SRC (object);
+  GstRfbSrc* src = GST_RFB_SRC(object);
 
   switch (prop_id) {
     case PROP_URI:
-      GST_OBJECT_LOCK (object);
-      if (src->uri)
-        g_value_take_string (value, gst_uri_to_string (src->uri));
-      else
-        g_value_set_string (value, NULL);
-      GST_OBJECT_UNLOCK (object);
+      GST_OBJECT_LOCK(object);
+      if (src->uri) {
+        g_value_take_string(value, gst_uri_to_string(src->uri));
+      }
+      else {
+        g_value_set_string(value, NULL);
+      }
+      GST_OBJECT_UNLOCK(object);
       break;
     case PROP_HOST:
-      g_value_set_string (value, src->host);
+      g_value_set_string(value, src->host);
       break;
     case PROP_PORT:
-      g_value_set_int (value, src->port);
+      g_value_set_int(value, src->port);
       break;
     case PROP_USERNAME:
-      g_value_set_string (value, src->username);
-      break;
-    case PROP_VERSION:
-      g_value_set_string (value, src->version);
+      g_value_set_string(value, src->username);
       break;
     case PROP_OFFSET_X:
-      g_value_set_int (value, src->offset_x);
+      g_value_set_int(value, src->offset_x);
       break;
     case PROP_OFFSET_Y:
-      g_value_set_int (value, src->offset_y);
+      g_value_set_int(value, src->offset_y);
       break;
     case PROP_WIDTH:
-      g_value_set_int (value, src->requested_width);
+      g_value_set_int(value, src->requested_width);
       break;
     case PROP_HEIGHT:
-      g_value_set_int (value, src->requested_height);
+      g_value_set_int(value, src->requested_height);
       break;
     case PROP_INCREMENTAL:
-      g_value_set_boolean (value, src->incremental_update);
+      g_value_set_boolean(value, src->incremental_update);
       break;
     case PROP_USE_COPYRECT:
-      g_value_set_boolean (value, src->use_copyrect);
+      g_value_set_boolean(value, src->use_copyrect);
       break;
     case PROP_ENCODINGS:
-      g_value_set_string (value, src->encodings);
+      g_value_set_string(value, src->encodings);
       break;
     case PROP_SHARED:
-      g_value_set_boolean (value, src->shared);
+      g_value_set_boolean(value, src->shared);
       break;
     case PROP_VIEWONLY:
-      g_value_set_boolean (value, src->view_only);
+      g_value_set_boolean(value, src->view_only);
       break;
     case PROP_CURSOR_MODE:
-      g_value_set_enum (value, src->cursor_mode);
+      g_value_set_enum(value, src->cursor_mode);
       break;
     case PROP_MAX_FRAMERATE:
-      g_value_set_int (value, src->max_framerate);
+      g_value_set_int(value, src->max_framerate);
       break;
     case PROP_FRAME_TIMEOUT_MS:
-      g_value_set_uint (value, src->frame_timeout_ms);
+      g_value_set_uint(value, src->frame_timeout_ms);
       break;
     case PROP_CONNECT_TIMEOUT:
-      g_value_set_uint (value, src->connect_timeout);
+      g_value_set_uint(value, src->connect_timeout);
       break;
     case PROP_READ_TIMEOUT:
-      g_value_set_uint (value, src->read_timeout);
+      g_value_set_uint(value, src->read_timeout);
       break;
     default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
       break;
   }
 }
 
-static gboolean
-gst_rfb_src_start (GstBaseSrc * bsrc)
-{
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+/* =========================================================================
+ * GStreamer element: state transitions and streaming
+ * ========================================================================= */
 
-  g_rec_mutex_lock (&src->client_lock);
-  gst_rfb_src_set_unlocked (src, FALSE);
+static gboolean gst_rfb_src_start(GstBaseSrc* bsrc)
+{
+  GstRfbSrc* src = GST_RFB_SRC(bsrc);
+
+  g_rec_mutex_lock(&src->client_lock);
+  gst_rfb_src_set_unlocked(src, FALSE);
   src->frame_valid = FALSE;
   src->frame_dirty = FALSE;
   src->cursor_dirty = FALSE;
@@ -2357,304 +2345,314 @@ gst_rfb_src_start (GstBaseSrc * bsrc)
   src->update_request_pending = FALSE;
   src->last_frame_time = GST_CLOCK_TIME_NONE;
   src->next_pts = 0;
-  gst_rfb_src_clear_pending_pointer (src);
-  g_rec_mutex_unlock (&src->client_lock);
+  gst_rfb_src_clear_pending_pointer(src);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return TRUE;
 }
 
-static gboolean
-gst_rfb_src_stop (GstBaseSrc * bsrc)
+static gboolean gst_rfb_src_stop(GstBaseSrc* bsrc)
 {
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  GstRfbSrc* src = GST_RFB_SRC(bsrc);
 
-  g_rec_mutex_lock (&src->client_lock);
-  gst_rfb_src_close (src);
-  gst_rfb_src_set_unlocked (src, FALSE);
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
+  gst_rfb_src_close(src);
+  gst_rfb_src_set_unlocked(src, FALSE);
+  g_rec_mutex_unlock(&src->client_lock);
 
   return TRUE;
 }
 
-static gboolean
-gst_rfb_src_negotiate (GstBaseSrc * bsrc)
+static gboolean gst_rfb_src_negotiate(GstBaseSrc* bsrc)
 {
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  GstRfbSrc* src = GST_RFB_SRC(bsrc);
   gboolean ret;
 
-  g_rec_mutex_lock (&src->client_lock);
-  ret = gst_rfb_src_open (src);
-  if (ret)
-    ret = gst_rfb_src_update_caps (src);
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
+  ret = gst_rfb_src_open(src);
+  if (ret) {
+    ret = gst_rfb_src_update_caps(src);
+  }
+  g_rec_mutex_unlock(&src->client_lock);
 
   return ret;
 }
 
-static GstFlowReturn
-gst_rfb_src_create (GstPushSrc * psrc, GstBuffer ** outbuf)
+static GstFlowReturn gst_rfb_src_create(GstPushSrc* psrc, GstBuffer** outbuf)
 {
-  GstRfbSrc *src = GST_RFB_SRC (psrc);
-  GstBuffer *buffer;
+  GstRfbSrc* src = GST_RFB_SRC(psrc);
+  GstBuffer* buffer;
   GstFlowReturn ret = GST_FLOW_OK;
 
   *outbuf = NULL;
 
-  g_rec_mutex_lock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
 
-  if (gst_rfb_src_is_unlocked (src)) {
+  if (gst_rfb_src_is_unlocked(src)) {
     ret = GST_FLOW_FLUSHING;
     goto out;
   }
 
-  if (!gst_rfb_src_open (src)) {
-    ret = gst_rfb_src_is_unlocked (src) ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
+  if (!gst_rfb_src_open(src)) {
+    ret = gst_rfb_src_is_unlocked(src) ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
     goto out;
   }
 
   if (src->geometry_changed) {
     src->geometry_changed = FALSE;
-    if (!gst_rfb_src_update_caps (src)) {
+    if (!gst_rfb_src_update_caps(src)) {
       ret = GST_FLOW_NOT_NEGOTIATED;
       goto out;
     }
-    gst_rfb_src_sync_client_update_rect (src);
+    gst_rfb_src_sync_client_update_rect(src);
   }
 
-  if (!gst_rfb_src_send_framebuffer_update_request (src) ||
-      !gst_rfb_src_wait_for_frame (src)) {
-    ret = gst_rfb_src_is_unlocked (src) ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
+  if (!gst_rfb_src_send_framebuffer_update_request(src) ||
+      !gst_rfb_src_wait_for_frame(src)) {
+    ret = gst_rfb_src_is_unlocked(src) ? GST_FLOW_FLUSHING : GST_FLOW_ERROR;
     goto out;
   }
 
-  gst_rfb_src_flush_pending_pointer_locked (src);
-
-  gst_rfb_src_maybe_fallback_cursor (src);
+  gst_rfb_src_flush_pending_pointer_locked(src);
+  gst_rfb_src_maybe_fallback_cursor(src);
 
   if (!src->frame_valid || src->client->frameBuffer == NULL) {
-    gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_READ,
-        "create", "no-framebuffer", "No VNC framebuffer available");
+    gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_READ, "create",
+                                    "no-framebuffer",
+                                    "No VNC framebuffer available");
     ret = GST_FLOW_ERROR;
     goto out;
   }
 
   if (src->pool) {
-    ret = gst_buffer_pool_acquire_buffer (src->pool, &buffer, NULL);
+    ret = gst_buffer_pool_acquire_buffer(src->pool, &buffer, NULL);
     if (ret != GST_FLOW_OK) {
-      if (ret != GST_FLOW_FLUSHING)
-        gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
-            "allocate-buffer", "output-buffer-acquisition-failed",
+      if (ret != GST_FLOW_FLUSHING) {
+        gst_rfb_src_post_resource_error(
+            src, GST_RESOURCE_ERROR_NO_SPACE_LEFT, "allocate-buffer",
+            "output-buffer-acquisition-failed",
             "Could not acquire output buffer from pool");
+      }
       goto out;
     }
-  } else {
-    buffer = gst_buffer_new_allocate (NULL, GST_VIDEO_INFO_SIZE (&src->vinfo),
-        NULL);
+  }
+  else {
+    buffer =
+        gst_buffer_new_allocate(NULL, GST_VIDEO_INFO_SIZE(&src->vinfo), NULL);
     if (buffer == NULL) {
-      gst_rfb_src_post_resource_error (src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
-          "allocate-buffer", "output-buffer-allocation-failed",
-          "Could not allocate output buffer");
+      gst_rfb_src_post_resource_error(src, GST_RESOURCE_ERROR_NO_SPACE_LEFT,
+                                      "allocate-buffer",
+                                      "output-buffer-allocation-failed",
+                                      "Could not allocate output buffer");
       ret = GST_FLOW_ERROR;
       goto out;
     }
   }
 
-  if (!gst_rfb_src_copy_frame (src, buffer)) {
-    gst_buffer_unref (buffer);
+  if (!gst_rfb_src_copy_frame(src, buffer)) {
+    gst_buffer_unref(buffer);
     ret = GST_FLOW_ERROR;
     goto out;
   }
 
   src->cursor_dirty = FALSE;
-  GST_BUFFER_PTS (buffer) = gst_rfb_src_get_running_time (src);
-  GST_BUFFER_DURATION (buffer) = src->frame_duration;
-  src->last_frame_time = gst_util_get_timestamp ();
+  GST_BUFFER_PTS(buffer) = gst_rfb_src_get_running_time(src);
+  GST_BUFFER_DURATION(buffer) = src->frame_duration;
+  src->last_frame_time = gst_util_get_timestamp();
   *outbuf = buffer;
 
 out:
-  if (ret == GST_FLOW_OK && src->connected)
-    gst_rfb_src_flush_pending_pointer_locked (src);
-  g_rec_mutex_unlock (&src->client_lock);
+  if (ret == GST_FLOW_OK && src->connected) {
+    gst_rfb_src_flush_pending_pointer_locked(src);
+  }
+  g_rec_mutex_unlock(&src->client_lock);
   return ret;
 }
 
-
-static gboolean
-gst_rfb_src_unlock (GstBaseSrc * bsrc)
+static gboolean gst_rfb_src_unlock(GstBaseSrc* bsrc)
 {
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  GstRfbSrc* src = GST_RFB_SRC(bsrc);
 
   /* Set the flag atomically first so the streaming thread can exit even if it
    * never enters WaitForMessage (e.g. it is inside HandleRFBServerMessage). */
-  gst_rfb_src_set_unlocked (src, TRUE);
+  gst_rfb_src_set_unlocked(src, TRUE);
 
   /* Close the socket to unblock WaitForMessage.  src->client is managed under
    * client_lock, so acquire it here to avoid a race with rfbClientCleanup. */
-  g_rec_mutex_lock (&src->client_lock);
-  if (src->client)
-    rfbCloseSocket (src->client->sock);
-  g_rec_mutex_unlock (&src->client_lock);
+  g_rec_mutex_lock(&src->client_lock);
+  if (src->client) {
+    rfbCloseSocket(src->client->sock);
+  }
+  g_rec_mutex_unlock(&src->client_lock);
 
   return TRUE;
 }
 
-static gboolean
-gst_rfb_src_unlock_stop (GstBaseSrc * bsrc)
+static gboolean gst_rfb_src_unlock_stop(GstBaseSrc* bsrc)
 {
-  GstRfbSrc *src = GST_RFB_SRC (bsrc);
+  GstRfbSrc* src = GST_RFB_SRC(bsrc);
 
-  GST_OBJECT_LOCK (src);
-  gst_rfb_src_set_unlocked (src, FALSE);
-  GST_OBJECT_UNLOCK (src);
+  GST_OBJECT_LOCK(src);
+  gst_rfb_src_set_unlocked(src, FALSE);
+  GST_OBJECT_UNLOCK(src);
 
   return TRUE;
 }
 
-static GstURIType
-gst_rfb_src_uri_get_type (GType type)
+/* =========================================================================
+ * URI handler
+ * ========================================================================= */
+
+static GstURIType gst_rfb_src_uri_get_type(GType type)
 {
-  (void) type;
+  (void)type;
   return GST_URI_SRC;
 }
 
-static const gchar *const *
-gst_rfb_src_uri_get_protocols (GType type)
+static const gchar* const* gst_rfb_src_uri_get_protocols(GType type)
 {
-  static const gchar *protocols[] = { (char *) "rfb", (char *) "vnc", NULL };
+  static const gchar* protocols[] = {(char*)"rfb", (char*)"vnc", NULL};
 
-  (void) type;
+  (void)type;
   return protocols;
 }
 
-static gchar *
-gst_rfb_src_uri_get_uri (GstURIHandler * handler)
+static gchar* gst_rfb_src_uri_get_uri(GstURIHandler* handler)
 {
-  GstRfbSrc *src = (GstRfbSrc *) handler;
-  gchar *str_uri = NULL;
+  GstRfbSrc* src = (GstRfbSrc*)handler;
+  gchar* str_uri = NULL;
 
-  GST_OBJECT_LOCK (src);
-  if (src->uri)
-    str_uri = gst_uri_to_string (src->uri);
-  GST_OBJECT_UNLOCK (src);
+  GST_OBJECT_LOCK(src);
+  if (src->uri) {
+    str_uri = gst_uri_to_string(src->uri);
+  }
+  GST_OBJECT_UNLOCK(src);
 
   return str_uri;
 }
 
-static void
-gst_rfb_src_set_properties_from_uri_query (GObject * object,
-    const GstUri * uri)
+static void gst_rfb_src_set_properties_from_uri_query(GObject* object,
+                                                      const GstUri* uri)
 {
-  GHashTable *query_table;
+  GHashTable* query_table;
   GHashTableIter iter;
   gpointer key;
   gpointer value;
 
-  query_table = gst_uri_get_query_table (uri);
-  if (query_table == NULL)
+  query_table = gst_uri_get_query_table(uri);
+  if (query_table == NULL) {
     return;
+  }
 
-  g_hash_table_iter_init (&iter, query_table);
-  while (g_hash_table_iter_next (&iter, &key, &value)) {
-    if (key == NULL || value == NULL)
+  g_hash_table_iter_init(&iter, query_table);
+  while (g_hash_table_iter_next(&iter, &key, &value)) {
+    if (key == NULL || value == NULL) {
       continue;
-
-    GST_DEBUG_OBJECT (object, "setting property '%s' from URI query",
-        (const gchar *) key);
-    gst_util_set_object_arg (object, (const gchar *) key,
-        (const gchar *) value);
-  }
-
-  g_hash_table_unref (query_table);
-}
-
-static gboolean
-gst_rfb_src_uri_set_uri (GstURIHandler * handler, const gchar * str_uri,
-    GError ** error)
-{
-  GstRfbSrc *src = (GstRfbSrc *) handler;
-  GstUri *uri = NULL;
-  const gchar *scheme;
-  const gchar *userinfo;
-  const gchar *host;
-  guint port;
-
-  g_return_val_if_fail (str_uri != NULL, FALSE);
-
-  if (gst_rfb_src_is_running (src)) {
-    g_set_error (error, GST_URI_ERROR, GST_URI_ERROR_BAD_STATE,
-        "Changing the URI on rfbsrc when it is running is not supported");
-    GST_ERROR_OBJECT (src,
-        "Changing the URI on rfbsrc when it is running is not supported");
-    return FALSE;
-  }
-
-  uri = gst_uri_from_string (str_uri);
-  if (uri == NULL) {
-    g_set_error (error, GST_URI_ERROR, GST_URI_ERROR_BAD_URI,
-        "Invalid URI: %s", str_uri);
-    return FALSE;
-  }
-
-  scheme = gst_uri_get_scheme (uri);
-  if (g_strcmp0 (scheme, "rfb") != 0 && g_strcmp0 (scheme, "vnc") != 0) {
-    g_set_error (error, GST_URI_ERROR, GST_URI_ERROR_BAD_URI,
-        "Invalid URI scheme '%s' (expected rfb or vnc)", GST_STR_NULL (scheme));
-    gst_uri_unref (uri);
-    return FALSE;
-  }
-
-  host = gst_uri_get_host (uri);
-  if (host && *host)
-    g_object_set (src, "host", host, NULL);
-
-  port = gst_uri_get_port (uri);
-  if (port != GST_URI_NO_PORT)
-    g_object_set (src, "port", (gint) port, NULL);
-  else
-    g_object_set (src, "port", DEFAULT_PROP_PORT, NULL);
-
-  userinfo = gst_uri_get_userinfo (uri);
-  if (userinfo) {
-    gchar **split;
-    gchar *user = NULL;
-    gchar *pass = NULL;
-
-    split = g_strsplit (userinfo, ":", 2);
-    if (split[0] && split[1]) {
-      user = g_uri_unescape_string (split[0], NULL);
-      pass = g_uri_unescape_string (split[1], NULL);
-    } else if (split[0]) {
-      pass = g_uri_unescape_string (split[0], NULL);
     }
 
-    if (user)
-      g_object_set (src, "username", user, NULL);
-    if (pass)
-      g_object_set (src, "password", pass, NULL);
-
-    g_free (user);
-    g_free (pass);
-    g_strfreev (split);
+    GST_DEBUG_OBJECT(object, "setting property '%s' from URI query",
+                     (const gchar*)key);
+    gst_util_set_object_arg(object, (const gchar*)key, (const gchar*)value);
   }
 
-  GST_OBJECT_LOCK (src);
-  if (src->uri)
-    gst_uri_unref (src->uri);
-  src->uri = gst_uri_ref (uri);
-  GST_OBJECT_UNLOCK (src);
+  g_hash_table_unref(query_table);
+}
 
-  gst_rfb_src_set_properties_from_uri_query (G_OBJECT (src), uri);
-  gst_uri_unref (uri);
+static gboolean gst_rfb_src_uri_set_uri(GstURIHandler* handler,
+                                        const gchar* str_uri, GError** error)
+{
+  GstRfbSrc* src = (GstRfbSrc*)handler;
+  GstUri* uri = NULL;
+  const gchar* scheme;
+  const gchar* userinfo;
+  const gchar* host;
+  guint port;
+
+  g_return_val_if_fail(str_uri != NULL, FALSE);
+
+  if (gst_rfb_src_is_running(src)) {
+    g_set_error(
+        error, GST_URI_ERROR, GST_URI_ERROR_BAD_STATE,
+        "Changing the URI on rfbsrc when it is running is not supported");
+    GST_ERROR_OBJECT(
+        src, "Changing the URI on rfbsrc when it is running is not supported");
+    return FALSE;
+  }
+
+  uri = gst_uri_from_string(str_uri);
+  if (uri == NULL) {
+    g_set_error(error, GST_URI_ERROR, GST_URI_ERROR_BAD_URI, "Invalid URI: %s",
+                str_uri);
+    return FALSE;
+  }
+
+  scheme = gst_uri_get_scheme(uri);
+  if (g_strcmp0(scheme, "rfb") != 0 && g_strcmp0(scheme, "vnc") != 0) {
+    g_set_error(error, GST_URI_ERROR, GST_URI_ERROR_BAD_URI,
+                "Invalid URI scheme '%s' (expected rfb or vnc)",
+                GST_STR_NULL(scheme));
+    gst_uri_unref(uri);
+    return FALSE;
+  }
+
+  host = gst_uri_get_host(uri);
+  if (host && *host) {
+    g_object_set(src, "host", host, NULL);
+  }
+
+  port = gst_uri_get_port(uri);
+  if (port != GST_URI_NO_PORT) {
+    g_object_set(src, "port", (gint)port, NULL);
+  }
+  else {
+    g_object_set(src, "port", DEFAULT_PROP_PORT, NULL);
+  }
+
+  userinfo = gst_uri_get_userinfo(uri);
+  if (userinfo) {
+    gchar** split;
+    gchar* user = NULL;
+    gchar* pass = NULL;
+
+    split = g_strsplit(userinfo, ":", 2);
+    if (split[0] && split[1]) {
+      user = g_uri_unescape_string(split[0], NULL);
+      pass = g_uri_unescape_string(split[1], NULL);
+    }
+    else if (split[0]) {
+      pass = g_uri_unescape_string(split[0], NULL);
+    }
+
+    if (user) {
+      g_object_set(src, "username", user, NULL);
+    }
+    if (pass) {
+      g_object_set(src, "password", pass, NULL);
+    }
+
+    g_free(user);
+    g_free(pass);
+    g_strfreev(split);
+  }
+
+  GST_OBJECT_LOCK(src);
+  if (src->uri) {
+    gst_uri_unref(src->uri);
+  }
+  src->uri = gst_uri_ref(uri);
+  GST_OBJECT_UNLOCK(src);
+
+  gst_rfb_src_set_properties_from_uri_query(G_OBJECT(src), uri);
+  gst_uri_unref(uri);
 
   return TRUE;
 }
 
-static void
-gst_rfb_src_uri_handler_init (gpointer g_iface, gpointer iface_data)
+static void gst_rfb_src_uri_handler_init(gpointer g_iface, gpointer iface_data)
 {
-  GstURIHandlerInterface *iface = (GstURIHandlerInterface *) g_iface;
+  GstURIHandlerInterface* iface = (GstURIHandlerInterface*)g_iface;
 
-  (void) iface_data;
+  (void)iface_data;
 
   iface->get_type = gst_rfb_src_uri_get_type;
   iface->get_protocols = gst_rfb_src_uri_get_protocols;
@@ -2662,14 +2660,16 @@ gst_rfb_src_uri_handler_init (gpointer g_iface, gpointer iface_data)
   iface->set_uri = gst_rfb_src_uri_set_uri;
 }
 
-static gboolean
-plugin_init (GstPlugin * plugin)
+/* =========================================================================
+ * Plugin registration
+ * ========================================================================= */
+
+static gboolean plugin_init(GstPlugin* plugin)
 {
-  return GST_ELEMENT_REGISTER (rfbsrc, plugin);
+  return GST_ELEMENT_REGISTER(rfbsrc, plugin);
 }
 
-GST_PLUGIN_DEFINE (GST_VERSION_MAJOR,
-    GST_VERSION_MINOR,
-    rfbsrc,
+GST_PLUGIN_DEFINE(
+    GST_VERSION_MAJOR, GST_VERSION_MINOR, rfbsrc,
     "Connects to a VNC server through LibVNCClient and decodes RFB stream",
     plugin_init, VERSION, GST_LICENSE, GST_PACKAGE_NAME, GST_PACKAGE_ORIGIN)
